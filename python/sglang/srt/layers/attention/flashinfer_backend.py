@@ -1118,6 +1118,13 @@ class FlashInferIndicesUpdaterDecode:
                 )
             )
 
+        # Notify the KV pool which positions will be read (for selective dequant).
+        kv_last_index = kv_indptr[-1]
+        if hasattr(self.token_to_kv_pool, "set_active_kv_indices"):
+            self.token_to_kv_pool.set_active_kv_indices(
+                kv_indices[:kv_last_index]
+            )
+
         global global_override_indptr_cpu
         locally_override = False
         if seq_lens_cpu is not None and global_override_indptr_cpu is None:

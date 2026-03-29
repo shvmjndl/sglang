@@ -92,10 +92,9 @@ class ModelRunnerKVCacheMixin:
             per_head_compressed = compute_packed_dim_mixed(head_dim, bits) + norm_bytes
             # Compressed storage is per-layer
             cell_size = num_kv_heads * per_head_compressed * 2 * num_layers
-            # Per-layer write-through buffers (dequantized K + V in working dtype)
+            # Shared workspace buffers (one K + one V, NOT per-layer)
             dtype_size = torch._utils._element_size(self.dtype)
-            per_head_wt = head_dim * dtype_size
-            cell_size += num_kv_heads * per_head_wt * 2 * num_layers
+            cell_size += num_kv_heads * head_dim * dtype_size * 2
             return cell_size
 
         kv_size = torch._utils._element_size(self.kv_cache_dtype)

@@ -4,15 +4,9 @@ TurboQuant memory pool for KV cache compression.
 Implements Google's TurboQuant (ICLR 2026) KV cache quantization.
 Stores bit-packed centroid indices + L2 norms per head per token.
 
-Two operating modes for reads:
-  1. Selective dequant (default): call set_active_indices(indices) before
-     get_kv_buffer to dequant only the needed positions into a shared
-     workspace.  O(active_tokens) per read.
-  2. Write-through fallback: if set_active_indices is never called,
-     set_kv_buffer writes through to per-layer bf16 buffers so reads
-     are O(1) pointer returns.  Uses more memory but always correct.
-
-Follows the same pattern as MHATokenToKVPoolFP4 for buffer management.
+Reads use selective dequantization: only the active token positions
+(set via set_active_kv_indices) are dequantized into a shared workspace.
+This gives O(active_tokens) reads with real memory savings (~3.76x at 4-bit).
 """
 
 from contextlib import nullcontext
@@ -55,9 +49,14 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
       - Bit-packed centroid indices (uint8, packed at b bits/coord)
       - L2 norm (float32, 1 per token-head)
 
-    Reads use per-layer write-through buffers that are updated on every
-    set_kv_buffer call, so _get_key_buffer / _get_value_buffer are O(1).
-    The compressed storage is authoritative for move_kv_cache.
+    On read, only the active token positions are dequantized into a shared
+    workspace buffer (one K, one V — NOT per-layer).  The attention backend
+    calls set_active_kv_indices() before get_kv_buffer() to specify which
+    positions will be read.
+
+    Memory: compressed storage (per-layer) + shared workspace (one pair).
+    At 4-bit this gives ~3.76x compression of the per-layer storage, with
+    the workspace adding a small constant overhead.
     """
 
     def __init__(
@@ -82,12 +81,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         self.mode = mode
         self.is_mixed, self.bits_hi, self.bits_lo = parse_bits(bits)
 
-        # Cache padded dimensions (needed for prod mode QJL buffers)
         self.padded_head_dim = _next_power_of_2(head_dim)
         effective_v = v_head_dim if v_head_dim is not None else head_dim
         self.v_padded_head_dim = _next_power_of_2(effective_v)
 
-        # Hadamard transforms: for mixed-precision each group gets its own.
+        # Hadamard transforms
         torch_device = torch.device(device)
         if self.is_mixed:
             k_split = head_dim // 2
@@ -116,6 +114,9 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 effective_v, seed=_HADAMARD_SEED_V, device=torch_device
             )
 
+        # Active indices: set by attention backend before get_kv_buffer
+        self._active_indices: Optional[torch.Tensor] = None
+
         super().__init__(
             size=size,
             page_size=page_size,
@@ -135,7 +136,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         initialize_centroids_cache(torch_device)
 
     def _create_buffers(self):
-        """Allocate compressed storage + per-layer write-through buffers."""
+        """Allocate compressed storage + shared workspace."""
         self.store_dtype = torch.uint8
 
         m = self.size + self.page_size
@@ -152,16 +153,14 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 self.k_buffer = [
                     torch.zeros(
                         (m, self.head_num, k_packed_dim),
-                        dtype=torch.uint8,
-                        device=self.device,
+                        dtype=torch.uint8, device=self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
                 self.v_buffer = [
                     torch.zeros(
                         (m, self.head_num, v_packed_dim),
-                        dtype=torch.uint8,
-                        device=self.device,
+                        dtype=torch.uint8, device=self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
@@ -212,27 +211,23 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                         for _ in range(self.layer_num)
                     ]
 
-                # Per-layer write-through buffers (dequantized K/V in working dtype).
-                # Updated on set_kv_buffer so reads are O(1).
-                self._k_wt = [
-                    torch.zeros(
-                        (m, self.head_num, self.head_dim),
-                        dtype=self.dtype, device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self._v_wt = [
-                    torch.zeros(
-                        (m, self.head_num, self.v_head_dim),
-                        dtype=self.dtype, device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                # Shared workspace: pool-sized, NOT per-layer.  Only the
+                # active positions are filled on each _get call.  FlashInfer
+                # indexes into this via its page table — inactive positions
+                # are never read.
+                self._k_ws = torch.zeros(
+                    (m, self.head_num, self.head_dim),
+                    dtype=self.dtype, device=self.device,
+                )
+                self._v_ws = torch.zeros(
+                    (m, self.head_num, self.v_head_dim),
+                    dtype=self.dtype, device=self.device,
+                )
 
     def _clear_buffers(self):
         del self.k_buffer, self.v_buffer
         del self.k_norms_buffer, self.v_norms_buffer
-        del self._k_wt, self._v_wt
+        del self._k_ws, self._v_ws
         if self.mode == "prod":
             del self.k_qjl_buffer, self.v_qjl_buffer
             del self.k_residual_norms_buffer, self.v_residual_norms_buffer
@@ -240,10 +235,10 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
     def get_kv_size_bytes(self):
         k_size = sum(get_tensor_size_bytes(b) for b in self.k_buffer)
         k_size += sum(get_tensor_size_bytes(b) for b in self.k_norms_buffer)
-        k_size += sum(get_tensor_size_bytes(b) for b in self._k_wt)
+        k_size += get_tensor_size_bytes(self._k_ws)
         v_size = sum(get_tensor_size_bytes(b) for b in self.v_buffer)
         v_size += sum(get_tensor_size_bytes(b) for b in self.v_norms_buffer)
-        v_size += sum(get_tensor_size_bytes(b) for b in self._v_wt)
+        v_size += get_tensor_size_bytes(self._v_ws)
         if self.mode == "prod":
             k_size += sum(get_tensor_size_bytes(b) for b in self.k_qjl_buffer)
             k_size += sum(
@@ -255,38 +250,98 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             )
         return k_size, v_size
 
-    # ── Read path: O(1) pointer return ──
+    # ── Active indices: set by attention backend before get_kv_buffer ──
+
+    def set_active_kv_indices(self, indices: torch.Tensor):
+        """Set the token positions that will be read in the next attention call.
+
+        Called by the attention backend after begin_forward() computes kv_indices.
+        Only these positions are dequantized in _get_key_buffer/_get_value_buffer.
+        """
+        self._active_indices = indices
+
+    # ── Read path: selective dequant into shared workspace ──
+
+    def _dequant_positions(self, layer_id: int, which: str):
+        """Dequant active positions for one layer into the shared workspace."""
+        idx = layer_id - self.start_layer
+        indices = self._active_indices
+
+        if which == "k":
+            packed = self.k_buffer[idx]
+            norms = self.k_norms_buffer[idx]
+            ws = self._k_ws
+            out_dim = self.head_dim
+        else:
+            packed = self.v_buffer[idx]
+            norms = self.v_norms_buffer[idx]
+            ws = self._v_ws
+            out_dim = self.v_head_dim
+
+        if indices is not None and indices.numel() > 0:
+            # Selective: dequant only active positions
+            unique_indices = torch.unique(indices)
+            sel_packed = packed[unique_indices]   # (n_active, heads, packed_dim)
+            sel_norms = norms[unique_indices]     # (n_active, heads) or (n_active, heads, 2)
+            n_active = unique_indices.shape[0]
+        else:
+            # Fallback: dequant everything (slow, but correct)
+            sel_packed = packed
+            sel_norms = norms
+            unique_indices = None
+            n_active = packed.shape[0]
+
+        # Flatten for dequant: (n_active * heads, packed_dim)
+        flat_packed = sel_packed.reshape(-1, sel_packed.shape[-1])
+
+        if self.is_mixed:
+            flat_norms_hi = sel_norms[..., 0].reshape(-1)
+            flat_norms_lo = sel_norms[..., 1].reshape(-1)
+            hi_padded = _next_power_of_2(self._k_split_dim if which == "k" else self._v_split_dim)
+            hi_packed_dim = compute_packed_dim(hi_padded, self.bits_hi)
+            split_dim = self._k_split_dim if which == "k" else self._v_split_dim
+            q = {
+                "packed_hi": flat_packed[:, :hi_packed_dim],
+                "packed_lo": flat_packed[:, hi_packed_dim:],
+                "norms_hi": flat_norms_hi,
+                "norms_lo": flat_norms_lo,
+                "padded_dim_hi": hi_padded,
+                "padded_dim_lo": _next_power_of_2(out_dim - split_dim),
+                "split_dim": split_dim,
+                "bits_hi": self.bits_hi,
+                "bits_lo": self.bits_lo,
+            }
+            h_hi = self.k_hadamard_hi if which == "k" else self.v_hadamard_hi
+            h_lo = self.k_hadamard_lo if which == "k" else self.v_hadamard_lo
+            recon = turboquant_dequantize_mixed(q, h_hi, h_lo, self.dtype)
+        else:
+            flat_norms = sel_norms.reshape(-1)
+            q = {
+                "packed_indices": flat_packed,
+                "norms": flat_norms,
+                "padded_dim": self.padded_head_dim if which == "k" else self.v_padded_head_dim,
+            }
+            h = self.k_hadamard if which == "k" else self.v_hadamard
+            recon = turboquant_dequantize(q, h, int(self.bits), self.mode, self.dtype)
+
+        recon = recon[:, :out_dim].reshape(n_active, self.head_num, out_dim)
+
+        if unique_indices is not None:
+            ws[unique_indices] = recon
+        else:
+            ws[:n_active] = recon
 
     def _get_key_buffer(self, layer_id: int):
-        return self._k_wt[layer_id - self.start_layer]
+        """Dequant active positions into shared workspace and return it."""
+        self._dequant_positions(layer_id, "k")
+        return self._k_ws
 
     def _get_value_buffer(self, layer_id: int):
-        return self._v_wt[layer_id - self.start_layer]
+        """Dequant active positions into shared workspace and return it."""
+        self._dequant_positions(layer_id, "v")
+        return self._v_ws
 
-    # ── Write path: quantize + store compressed + write-through dequant ──
-
-    def _dequant_to_wt(self, k_q, v_q, loc, idx, num_tokens):
-        """Dequantize and write to per-layer write-through buffers."""
-        if self.is_mixed:
-            k_recon = turboquant_dequantize_mixed(
-                k_q, self.k_hadamard_hi, self.k_hadamard_lo, self.dtype
-            )
-            v_recon = turboquant_dequantize_mixed(
-                v_q, self.v_hadamard_hi, self.v_hadamard_lo, self.dtype
-            )
-        else:
-            k_recon = turboquant_dequantize(
-                k_q, self.k_hadamard, int(self.bits), self.mode, self.dtype
-            )
-            v_recon = turboquant_dequantize(
-                v_q, self.v_hadamard, int(self.bits), self.mode, self.dtype
-            )
-        self._k_wt[idx][loc] = k_recon[:, : self.head_dim].reshape(
-            num_tokens, self.head_num, self.head_dim
-        )
-        self._v_wt[idx][loc] = v_recon[:, : self.v_head_dim].reshape(
-            num_tokens, self.head_num, self.v_head_dim
-        )
+    # ── Write path: quantize and store compressed only ──
 
     def set_kv_buffer(
         self,
@@ -298,7 +353,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        """Quantize, store compressed, and write-through dequantized data."""
+        """Quantize and store compressed KV entries."""
         layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
         idx = layer_id - self.start_layer
         num_tokens = cache_k.shape[0]
@@ -344,9 +399,6 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.k_residual_norms_buffer[idx][loc] = k_q["residual_norms"].reshape(num_tokens, self.head_num)
             self.v_residual_norms_buffer[idx][loc] = v_q["residual_norms"].reshape(num_tokens, self.head_num)
 
-        # Write-through: dequant into per-layer buffers
-        self._dequant_to_wt(k_q, v_q, loc, idx, num_tokens)
-
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if tgt_loc.numel() == 0:
             return
@@ -355,8 +407,6 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
             self.k_norms_buffer[i][tgt_loc] = self.k_norms_buffer[i][src_loc]
             self.v_norms_buffer[i][tgt_loc] = self.v_norms_buffer[i][src_loc]
-            self._k_wt[i][tgt_loc] = self._k_wt[i][src_loc]
-            self._v_wt[i][tgt_loc] = self._v_wt[i][src_loc]
             if self.mode == "prod":
                 self.k_qjl_buffer[i][tgt_loc] = self.k_qjl_buffer[i][src_loc]
                 self.v_qjl_buffer[i][tgt_loc] = self.v_qjl_buffer[i][src_loc]
