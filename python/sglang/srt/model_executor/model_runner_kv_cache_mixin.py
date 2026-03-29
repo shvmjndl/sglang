@@ -89,12 +89,13 @@ class ModelRunnerKVCacheMixin:
             is_mixed = parse_bits(bits)[0]
             # packed indices + norms (2 norms per head for mixed, 1 for uniform)
             norm_bytes = 8 if is_mixed else 4  # float32 per norm
-            per_head = compute_packed_dim_mixed(head_dim, bits) + norm_bytes
+            per_head_compressed = compute_packed_dim_mixed(head_dim, bits) + norm_bytes
             # Compressed storage is per-layer
-            cell_size = num_kv_heads * per_head * 2 * num_layers  # x2 for K and V
-            # Shared workspace buffers (one K + one V, NOT per-layer)
+            cell_size = num_kv_heads * per_head_compressed * 2 * num_layers
+            # Per-layer write-through buffers (dequantized K + V in working dtype)
             dtype_size = torch._utils._element_size(self.dtype)
-            cell_size += num_kv_heads * head_dim * dtype_size * 2  # K + V workspace
+            per_head_wt = head_dim * dtype_size
+            cell_size += num_kv_heads * per_head_wt * 2 * num_layers
             return cell_size
 
         kv_size = torch._utils._element_size(self.kv_cache_dtype)

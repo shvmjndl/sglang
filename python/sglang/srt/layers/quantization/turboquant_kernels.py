@@ -73,12 +73,38 @@ CENTROIDS_4BIT = [
 ]
 
 
+_CENTROIDS_TABLE = {
+    1: CENTROIDS_1BIT,
+    2: CENTROIDS_2BIT,
+    3: CENTROIDS_3BIT,
+    4: CENTROIDS_4BIT,
+}
+
+# Cache centroid tensors per (bits, device) to avoid CUDA allocations during
+# cudagraph capture.  Populated lazily on first call per device.
+_centroids_cache: dict = {}
+
+
 def _get_centroids_tensor(bits: int, device: torch.device) -> torch.Tensor:
-    """Return the centroid tensor for the given bit-width."""
-    table = {1: CENTROIDS_1BIT, 2: CENTROIDS_2BIT, 3: CENTROIDS_3BIT, 4: CENTROIDS_4BIT}
-    if bits not in table:
+    """Return the centroid tensor for the given bit-width (cached per device)."""
+    if bits not in _CENTROIDS_TABLE:
         raise ValueError(f"TurboQuant supports 1-4 bits, got {bits}")
-    return torch.tensor(table[bits], dtype=torch.float32, device=device)
+    key = (bits, device)
+    if key not in _centroids_cache:
+        _centroids_cache[key] = torch.tensor(
+            _CENTROIDS_TABLE[bits], dtype=torch.float32, device=device
+        )
+    return _centroids_cache[key]
+
+
+def initialize_centroids_cache(device: torch.device):
+    """Pre-populate centroid cache for all bit-widths on the given device.
+
+    Call this before cudagraph capture to ensure no CUDA allocations happen
+    during the capture phase.
+    """
+    for bits in _CENTROIDS_TABLE:
+        _get_centroids_tensor(bits, device)
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +113,18 @@ def _get_centroids_tensor(bits: int, device: torch.device) -> torch.Tensor:
 # We use a randomized Hadamard transform: H_d * diag(s) where s_i ~ Rademacher
 # (random +/-1).  This is O(d log d) and a near-isometry, matching the paper's
 # requirement of a random rotation that makes coordinates near-independent.
+#
+# When available, the fused CUDA kernel from sglang.jit_kernel.hadamard is
+# used (~20-200x faster than the PyTorch fallback).
 # ---------------------------------------------------------------------------
+
+# Try to import the fast CUDA Hadamard kernel; fall back to pure-PyTorch.
+try:
+    from sglang.jit_kernel.hadamard import hadamard_transform as _cuda_hadamard
+
+    _HAS_CUDA_HADAMARD = True
+except ImportError:
+    _HAS_CUDA_HADAMARD = False
 
 
 def _generate_random_signs(dim: int, seed: int, device: torch.device) -> torch.Tensor:
@@ -101,12 +138,29 @@ def _next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _fwht_pytorch(x: torch.Tensor) -> torch.Tensor:
+    """Pure-PyTorch Fast Walsh-Hadamard Transform (fallback)."""
+    orig_shape = x.shape
+    n = orig_shape[-1]
+    x = x.reshape(-1, n).float()
+    h = 1
+    while h < n:
+        x = x.view(-1, n // (2 * h), 2, h)
+        a = x[:, :, 0, :]
+        b = x[:, :, 1, :]
+        x = torch.stack([a + b, a - b], dim=2)
+        x = x.view(-1, n)
+        h *= 2
+    return x.view(orig_shape)
+
+
 class HadamardTransform:
     """Manages the randomized Hadamard transform for TurboQuant.
 
     The transform is:  y = (1/sqrt(d)) * H_d * diag(signs) * x
 
     where H_d is the Walsh-Hadamard matrix and signs are random +/-1.
+    Uses a fused CUDA kernel when available (~20-200x faster).
     """
 
     def __init__(self, dim: int, seed: int = 42, device: torch.device = None):
@@ -118,6 +172,14 @@ class HadamardTransform:
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
 
+    def _apply_hadamard(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the unscaled Hadamard transform H*x using the fastest available backend."""
+        if _HAS_CUDA_HADAMARD and x.is_cuda:
+            # The CUDA kernel applies its own internal scale, so we pass
+            # scale=1.0 and handle scaling ourselves for consistency.
+            return _cuda_hadamard(x, scale=1.0)
+        return _fwht_pytorch(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply randomized Hadamard: y = scale * H * diag(signs) * x.
 
@@ -126,8 +188,7 @@ class HadamardTransform:
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
-        shape = x.shape
-        d = shape[-1]
+        d = x.shape[-1]
 
         # Pad to power-of-2 if needed
         if d < self.padded_dim:
@@ -136,8 +197,8 @@ class HadamardTransform:
         # Apply random signs
         x = x * self.signs
 
-        # In-place Fast Walsh-Hadamard Transform
-        x = self._fwht(x)
+        # Fast Walsh-Hadamard Transform
+        x = self._apply_hadamard(x)
 
         return x * self.scale
 
@@ -148,26 +209,9 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        x = self._fwht(y) * self.scale
+        x = self._apply_hadamard(y) * self.scale
         x = x * self.signs
         return x[..., : self.dim]
-
-    @staticmethod
-    def _fwht(x: torch.Tensor) -> torch.Tensor:
-        """Fast Walsh-Hadamard Transform along the last dimension."""
-        orig_shape = x.shape
-        n = orig_shape[-1]
-        x = x.reshape(-1, n).float()
-        h = 1
-        while h < n:
-            # Split into pairs and butterfly
-            x = x.view(-1, n // (2 * h), 2, h)
-            a = x[:, :, 0, :]
-            b = x[:, :, 1, :]
-            x = torch.stack([a + b, a - b], dim=2)
-            x = x.view(-1, n)
-            h *= 2
-        return x.view(orig_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +421,45 @@ def _turboquant_dequantize_kernel(
     tl.store(output_ptr + token_id * output_stride_0 + offs, vals, mask=mask)
 
 
+@triton.jit
+def _turboquant_fused_dequant_4bit_kernel(
+    packed_ptr,        # [num_tokens, packed_dim] uint8
+    norms_ptr,         # [num_tokens] float32
+    output_ptr,        # [num_tokens, padded_dim] float32
+    centroids_ptr,     # [16] float32 (scaled)
+    packed_stride_0: tl.constexpr,
+    output_stride_0: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused: unpack 4-bit → centroid lookup → norm multiply. One kernel, no intermediates."""
+    token_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    # Load norm once per token
+    norm = tl.load(norms_ptr + token_id)
+
+    offs = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < PACKED_DIM
+
+    packed = tl.load(packed_ptr + token_id * packed_stride_0 + offs, mask=mask, other=0).to(tl.int32)
+
+    idx_even = packed & 0x0F
+    idx_odd = (packed >> 4) & 0x0F
+
+    # Centroid lookup + norm multiply in one step
+    val_even = tl.load(centroids_ptr + idx_even, mask=mask, other=0.0) * norm
+    val_odd = tl.load(centroids_ptr + idx_odd, mask=mask, other=0.0) * norm
+
+    coord_even = offs * 2
+    coord_odd = offs * 2 + 1
+    tl.store(output_ptr + token_id * output_stride_0 + coord_even, val_even,
+             mask=mask & (coord_even < PADDED_DIM))
+    tl.store(output_ptr + token_id * output_stride_0 + coord_odd, val_odd,
+             mask=mask & (coord_odd < PADDED_DIM))
+
+
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
@@ -502,9 +585,29 @@ def turboquant_dequantize(
     scaled_centroids = centroids / math.sqrt(padded_dim)
 
     packed_dim = packed_indices.shape[-1]
-    dequant = torch.zeros(num_tokens, padded_dim, dtype=torch.float32, device=device)
 
-    # Use fused Triton kernel for 4-bit (the common case), PyTorch unpack for others
+    # Fast path: fused 4-bit MSE dequant (unpack + centroid + norm in one kernel)
+    if mse_bits == 4 and mode == "mse":
+        dequant = torch.zeros(num_tokens, padded_dim, dtype=torch.float32, device=device)
+        BLOCK_SIZE = 128
+        num_blocks = triton.cdiv(packed_dim, BLOCK_SIZE)
+        _turboquant_fused_dequant_4bit_kernel[(num_tokens, num_blocks)](
+            packed_indices,
+            norms,
+            dequant,
+            scaled_centroids,
+            packed_indices.stride(0),
+            dequant.stride(0),
+            PADDED_DIM=padded_dim,
+            PACKED_DIM=packed_dim,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        # dequant already has norm applied, just do Hadamard inverse
+        reconstructed = hadamard.inverse(dequant)
+        return reconstructed.to(output_dtype)
+
+    # General path: separate unpack → centroid → QJL correction → norm → Hadamard
+    dequant = torch.zeros(num_tokens, padded_dim, dtype=torch.float32, device=device)
     if mse_bits == 4:
         BLOCK_SIZE = 128
         num_blocks = triton.cdiv(packed_dim, BLOCK_SIZE)
@@ -519,7 +622,6 @@ def turboquant_dequantize(
             BLOCK_SIZE=BLOCK_SIZE,
         )
     else:
-        # Unpack then dequant via existing kernel
         indices = unpack_indices(packed_indices, mse_bits, padded_dim)
         BLOCK_SIZE = 128
         num_blocks = triton.cdiv(padded_dim, BLOCK_SIZE)
@@ -537,9 +639,8 @@ def turboquant_dequantize(
     if mode == "prod" and "qjl_signs" in quantized:
         qjl_packed = quantized["qjl_signs"]
         residual_norms = quantized["residual_norms"]
-        # Unpack 1-bit QJL signs and convert to +1/-1
         qjl_unpacked = unpack_indices(qjl_packed, 1, padded_dim).float()
-        qjl_signs = qjl_unpacked * 2.0 - 1.0  # 0/1 -> -1/+1
+        qjl_signs = qjl_unpacked * 2.0 - 1.0
         qjl_scale = math.sqrt(math.pi / 2) / padded_dim
         dequant += qjl_scale * residual_norms.unsqueeze(-1) * qjl_signs
 
