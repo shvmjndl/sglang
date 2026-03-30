@@ -1857,13 +1857,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._turboquant_mode = self.server_args.turboquant_mode
             # TurboQuant selective dequant uses dynamic-shape ops (torch.unique)
             # that are incompatible with CUDA graph capture.
-            if not server_args.disable_cuda_graph:
-                server_args.disable_cuda_graph = True
-                log_info_on_rank0(
-                    logger,
-                    "TurboQuant requires disable_cuda_graph=True (selective dequant "
-                    "uses dynamic-shape ops). CUDA graph has been disabled.",
-                )
+            if not self.server_args.disable_cuda_graph:
+                self.server_args.disable_cuda_graph = True
+            if not self.server_args.disable_piecewise_cuda_graph:
+                self.server_args.disable_piecewise_cuda_graph = True
+            log_info_on_rank0(
+                logger,
+                "CUDA graph and piecewise CUDA graph disabled for TurboQuant "
+                "(selective dequant uses dynamic-shape ops).",
+            )
             log_info_on_rank0(
                 logger,
                 f"TurboQuant KV cache compression enabled "
