@@ -84,9 +84,9 @@ def test_compression_ratios():
     for bits, expect_min in [(4, 3.5), (3, 4.5), (2, 7.0), (1, 12.0)]:
         r = compute_compression_ratio(128, bits)
         assert r >= expect_min, f"{bits}b: {r:.2f}x < {expect_min}x"
-    # Mixed precision
-    assert 4.0 < compute_compression_ratio(128, 3.5) < 5.0
-    assert 5.0 < compute_compression_ratio(128, 2.5) < 7.0
+    # Mixed precision (norm_bytes=8 for mixed: hi + lo norms)
+    assert 3.5 < compute_compression_ratio(128, 3.5) < 5.0
+    assert 4.5 < compute_compression_ratio(128, 2.5) < 7.0
     print("PASS: test_compression_ratios")
 
 

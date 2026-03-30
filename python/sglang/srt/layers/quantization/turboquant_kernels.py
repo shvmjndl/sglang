@@ -16,7 +16,7 @@ For KV cache compression at b total bits per coordinate:
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
@@ -794,72 +794,6 @@ def turboquant_dequantize_mixed(
 
 
 # ---------------------------------------------------------------------------
-# KV Cache specific quantize/dequantize wrappers
-# ---------------------------------------------------------------------------
-
-
-def turboquant_quantize_kv_cache(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_hadamard: HadamardTransform,
-    v_hadamard: HadamardTransform,
-    bits: int = 4,
-    mode: str = "mse",
-) -> Tuple[dict, dict]:
-    """Quantize both K and V cache entries.
-
-    Args:
-        k: (num_tokens, num_heads, head_dim) key tensor
-        v: (num_tokens, num_heads, head_dim) value tensor
-        k_hadamard: HadamardTransform for key dimension
-        v_hadamard: HadamardTransform for value dimension
-        bits: quantization bits
-        mode: "mse" or "prod"
-
-    Returns:
-        (k_quantized, v_quantized) dicts
-    """
-    num_tokens, num_heads, head_dim = k.shape
-
-    # Reshape to (num_tokens * num_heads, head_dim) for quantization
-    k_flat = k.reshape(-1, head_dim)
-    v_flat = v.reshape(-1, head_dim)
-
-    k_q = turboquant_quantize(k_flat, k_hadamard, bits, mode)
-    v_q = turboquant_quantize(v_flat, v_hadamard, bits, mode)
-
-    return k_q, v_q
-
-
-def turboquant_dequantize_kv_cache(
-    k_quantized: dict,
-    v_quantized: dict,
-    k_hadamard: HadamardTransform,
-    v_hadamard: HadamardTransform,
-    num_heads: int,
-    bits: int = 4,
-    mode: str = "mse",
-    output_dtype: torch.dtype = torch.bfloat16,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Dequantize both K and V cache entries.
-
-    Returns:
-        (k, v) tensors of shape (num_tokens, num_heads, head_dim)
-    """
-    k_recon = turboquant_dequantize(k_quantized, k_hadamard, bits, mode, output_dtype)
-    v_recon = turboquant_dequantize(v_quantized, v_hadamard, bits, mode, output_dtype)
-
-    total = k_recon.shape[0]
-    num_tokens = total // num_heads
-    head_dim = k_hadamard.dim
-
-    k_recon = k_recon[:, :head_dim].reshape(num_tokens, num_heads, head_dim)
-    v_recon = v_recon[:, :head_dim].reshape(num_tokens, num_heads, head_dim)
-
-    return k_recon, v_recon
-
-
-# ---------------------------------------------------------------------------
 # Compression ratio calculation
 # ---------------------------------------------------------------------------
 
@@ -879,13 +813,13 @@ def compute_compression_ratio(head_dim: int, bits, mode: str = "mse", dtype_byte
     is_mixed, bits_hi, bits_lo = parse_bits(bits)
 
     if is_mixed:
-        index_bytes = compute_packed_dim_mixed(padded_dim, bits)
+        index_bytes = compute_packed_dim_mixed(head_dim, bits)
     else:
         mse_bits = bits_hi - 1 if mode == "prod" else bits_hi
         index_bytes = compute_packed_dim(padded_dim, mse_bits)
 
-    # Norm: 1 float32 per token-head
-    norm_bytes = 4
+    # Norm: float32 per token-head (2 norms for mixed-precision: hi + lo)
+    norm_bytes = 8 if is_mixed else 4
     # QJL for prod mode: 1 bit per coord (packed) + 1 float32 residual norm
     qjl_bytes = 0
     if mode == "prod" and not is_mixed:

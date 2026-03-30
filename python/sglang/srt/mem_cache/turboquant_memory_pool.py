@@ -117,6 +117,8 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         # Active indices: set by attention backend before get_kv_buffer
         self._active_indices: Optional[torch.Tensor] = None
 
+        # TurboQuant uses compressed buffers incompatible with the
+        # parent's Triton-based kv_cache_copy (which expects contiguous bf16).
         super().__init__(
             size=size,
             page_size=page_size,
@@ -130,7 +132,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
-            enable_kv_cache_copy=enable_kv_cache_copy,
+            enable_kv_cache_copy=False,
         )
 
         initialize_centroids_cache(torch_device)
@@ -287,8 +289,8 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         flat_packed = sel_packed.reshape(-1, sel_packed.shape[-1])
 
         if self.is_mixed:
-            flat_norms_hi = sel_norms[..., 0].reshape(-1)
-            flat_norms_lo = sel_norms[..., 1].reshape(-1)
+            flat_norms_hi = sel_norms[..., 0].reshape(-1).contiguous()
+            flat_norms_lo = sel_norms[..., 1].reshape(-1).contiguous()
             hi_padded = _next_power_of_2(self._k_split_dim if which == "k" else self._v_split_dim)
             hi_packed_dim = compute_packed_dim(hi_padded, self.bits_hi)
             split_dim = self._k_split_dim if which == "k" else self._v_split_dim
@@ -313,6 +315,12 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 "norms": flat_norms,
                 "padded_dim": self.padded_head_dim if which == "k" else self.v_padded_head_dim,
             }
+            # Include QJL buffers for prod mode
+            if self.mode == "prod":
+                qjl_buf = self.k_qjl_buffer[idx] if which == "k" else self.v_qjl_buffer[idx]
+                res_buf = self.k_residual_norms_buffer[idx] if which == "k" else self.v_residual_norms_buffer[idx]
+                q["qjl_signs"] = qjl_buf[unique_indices].reshape(-1, qjl_buf.shape[-1])
+                q["residual_norms"] = res_buf[unique_indices].reshape(-1)
             h = self.k_hadamard if which == "k" else self.v_hadamard
             recon = turboquant_dequantize(q, h, int(self.bits), self.mode, self.dtype)
 
