@@ -278,18 +278,10 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             ws = self._v_ws
             out_dim = self.v_head_dim
 
-        if indices is not None and indices.numel() > 0:
-            # Selective: dequant only active positions
-            unique_indices = torch.unique(indices)
-            sel_packed = packed[unique_indices]   # (n_active, heads, packed_dim)
-            sel_norms = norms[unique_indices]     # (n_active, heads) or (n_active, heads, 2)
-            n_active = unique_indices.shape[0]
-        else:
-            # Fallback: dequant everything (slow, but correct)
-            sel_packed = packed
-            sel_norms = norms
-            unique_indices = None
-            n_active = packed.shape[0]
+        unique_indices = torch.unique(indices)
+        sel_packed = packed[unique_indices]   # (n_active, heads, packed_dim)
+        sel_norms = norms[unique_indices]     # (n_active, heads) or (n_active, heads, 2)
+        n_active = unique_indices.shape[0]
 
         # Flatten for dequant: (n_active * heads, packed_dim)
         flat_packed = sel_packed.reshape(-1, sel_packed.shape[-1])
@@ -325,20 +317,18 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             recon = turboquant_dequantize(q, h, int(self.bits), self.mode, self.dtype)
 
         recon = recon[:, :out_dim].reshape(n_active, self.head_num, out_dim)
-
-        if unique_indices is not None:
-            ws[unique_indices] = recon
-        else:
-            ws[:n_active] = recon
+        ws[unique_indices] = recon
 
     def _get_key_buffer(self, layer_id: int):
         """Dequant active positions into shared workspace and return it."""
-        self._dequant_positions(layer_id, "k")
+        if self._active_indices is not None and self._active_indices.numel() > 0:
+            self._dequant_positions(layer_id, "k")
         return self._k_ws
 
     def _get_value_buffer(self, layer_id: int):
         """Dequant active positions into shared workspace and return it."""
-        self._dequant_positions(layer_id, "v")
+        if self._active_indices is not None and self._active_indices.numel() > 0:
+            self._dequant_positions(layer_id, "v")
         return self._v_ws
 
     # ── Write path: quantize and store compressed only ──

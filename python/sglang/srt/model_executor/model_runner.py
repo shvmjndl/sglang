@@ -1855,6 +1855,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._turboquant_enabled = True
             self._turboquant_bits = self.server_args.turboquant_bits
             self._turboquant_mode = self.server_args.turboquant_mode
+            # TurboQuant selective dequant uses dynamic-shape ops (torch.unique)
+            # that are incompatible with CUDA graph capture.
+            if not server_args.disable_cuda_graph:
+                server_args.disable_cuda_graph = True
+                log_info_on_rank0(
+                    logger,
+                    "TurboQuant requires disable_cuda_graph=True (selective dequant "
+                    "uses dynamic-shape ops). CUDA graph has been disabled.",
+                )
             log_info_on_rank0(
                 logger,
                 f"TurboQuant KV cache compression enabled "

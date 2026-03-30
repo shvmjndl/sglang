@@ -1120,10 +1120,9 @@ class FlashInferIndicesUpdaterDecode:
 
         # Notify the KV pool which positions will be read (for selective dequant).
         kv_last_index = kv_indptr[-1]
-        if hasattr(self.token_to_kv_pool, "set_active_kv_indices"):
-            self.token_to_kv_pool.set_active_kv_indices(
-                kv_indices[:kv_last_index]
-            )
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(kv_pool, "set_active_kv_indices"):
+            kv_pool.set_active_kv_indices(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
         locally_override = False
@@ -1468,6 +1467,12 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
         )
+
+        # Notify the KV pool which positions will be read (for selective dequant).
+        kv_last_index = kv_indptr[-1]
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(kv_pool, "set_active_kv_indices"):
+            kv_pool.set_active_kv_indices(kv_indices[:kv_last_index])
 
 
 class FlashInferMultiStepDraftBackend:
