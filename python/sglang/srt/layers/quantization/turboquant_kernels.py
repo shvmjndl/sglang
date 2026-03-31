@@ -460,6 +460,344 @@ def _turboquant_fused_dequant_4bit_kernel(
              mask=mask & (coord_odd < PADDED_DIM))
 
 
+@triton.jit
+def _fused_gather_unpack_norm_4bit_kernel(
+    # Pool buffers
+    packed_ptr,          # [pool, heads, packed_dim] uint8
+    norms_ptr,           # [pool, heads] float32
+    indices_ptr,         # [N] int32 — active pool positions
+    centroids_ptr,       # [16] float32 (pre-scaled by 1/sqrt(d))
+    # Flat output: (N * heads, padded_dim) float32
+    output_ptr,
+    # Strides
+    packed_stride_tok,
+    packed_stride_head,
+    norms_stride_tok,
+    # Dimensions
+    NUM_HEADS: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+):
+    """Fused: gather from pool → unpack 4-bit → centroid lookup → norm scale.
+
+    Grid: (N, NUM_HEADS). One program per (active_token, head).
+    Output: contiguous (N * NUM_HEADS, PADDED_DIM) float32 ready for
+    the CUDA Hadamard kernel.
+    """
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pool_pos = tl.load(indices_ptr + tok_idx)
+    norm = tl.load(norms_ptr + pool_pos * norms_stride_tok + head_idx)
+
+    base = pool_pos * packed_stride_tok + head_idx * packed_stride_head
+    offs = tl.arange(0, PACKED_DIM)
+    packed = tl.load(packed_ptr + base + offs).to(tl.int32)
+
+    val_even = tl.load(centroids_ptr + (packed & 0x0F)) * norm
+    val_odd = tl.load(centroids_ptr + ((packed >> 4) & 0x0F)) * norm
+
+    out_row = tok_idx * NUM_HEADS + head_idx
+    out_base = out_row * PADDED_DIM
+    coord_even = offs * 2
+    coord_odd = offs * 2 + 1
+    tl.store(output_ptr + out_base + coord_even, val_even,
+             mask=coord_even < PADDED_DIM)
+    tl.store(output_ptr + out_base + coord_odd, val_odd,
+             mask=coord_odd < PADDED_DIM)
+
+
+@triton.jit
+def _fused_signs_scatter_kernel(
+    # Input: (N * heads, padded_dim) float32 — post-Hadamard
+    input_ptr,
+    # Signs vector
+    signs_ptr,           # [PADDED_DIM] float32
+    # Pool indices
+    indices_ptr,         # [N] int32
+    # Output workspace: [pool, heads, head_dim]
+    output_ptr,
+    output_stride_tok,
+    output_stride_head,
+    # Dims
+    NUM_HEADS: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    SCALE: tl.constexpr,       # 1/sqrt(padded_dim)
+    OUTPUT_BF16: tl.constexpr,
+):
+    """Fused: signs multiply → scale → truncate → cast → scatter to workspace.
+
+    Grid: (N, NUM_HEADS).
+    """
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    in_row = tok_idx * NUM_HEADS + head_idx
+    offs = tl.arange(0, PADDED_DIM)
+    mask = offs < HEAD_DIM
+
+    vals = tl.load(input_ptr + in_row * PADDED_DIM + offs, mask=offs < PADDED_DIM, other=0.0)
+    signs = tl.load(signs_ptr + offs, mask=offs < PADDED_DIM, other=1.0)
+    vals = vals * SCALE * signs
+
+    pool_pos = tl.load(indices_ptr + tok_idx)
+    out_base = pool_pos * output_stride_tok + head_idx * output_stride_head
+
+    if OUTPUT_BF16:
+        tl.store(output_ptr + out_base + offs, vals.to(tl.bfloat16), mask=mask)
+    else:
+        tl.store(output_ptr + out_base + offs, vals, mask=mask)
+
+
+def turboquant_dequant_fused(
+    packed: torch.Tensor,
+    norms: torch.Tensor,
+    indices: torch.Tensor,
+    hadamard: "HadamardTransform",
+    scaled_centroids: torch.Tensor,
+    workspace: torch.Tensor,
+    head_dim: int,
+    padded_dim: int,
+    skip_hadamard: bool = False,
+):
+    """Fused dequant: 3 kernels (full) or 2 kernels (rotated-domain).
+
+    Full mode (skip_hadamard=False):
+      1. Triton: gather + unpack + centroid + norm → flat
+      2. CUDA Hadamard in-place
+      3. Triton: signs + scale + truncate + scatter → workspace
+
+    Rotated-domain mode (skip_hadamard=True):
+      1. Triton: gather + unpack + centroid + norm → flat
+      2. Triton: truncate + cast + scatter → workspace
+      Skips Hadamard/signs — the attention backend rotates Q/output instead.
+    """
+    n_active = indices.shape[0]
+    num_heads = packed.shape[1]
+    packed_dim = packed.shape[2]
+    output_bf16 = workspace.dtype in (torch.bfloat16, torch.float16)
+
+    flat = torch.empty(n_active * num_heads, padded_dim,
+                       dtype=torch.float32, device=packed.device)
+
+    _fused_gather_unpack_norm_4bit_kernel[(n_active, num_heads)](
+        packed, norms, indices, scaled_centroids, flat,
+        packed.stride(0), packed.stride(1),
+        norms.stride(0),
+        NUM_HEADS=num_heads,
+        PADDED_DIM=padded_dim,
+        PACKED_DIM=packed_dim,
+    )
+
+    if skip_hadamard:
+        # Rotated domain: just truncate + cast + scatter. No signs, no scale.
+        recon = flat[:, :head_dim].reshape(n_active, num_heads, head_dim)
+        if output_bf16:
+            recon = recon.to(workspace.dtype)
+        workspace[indices] = recon
+        return
+    else:
+        flat = hadamard._apply_hadamard(flat)
+        _fused_signs_scatter_kernel[(n_active, num_heads)](
+            flat, hadamard.signs, indices, workspace,
+            workspace.stride(0), workspace.stride(1),
+            NUM_HEADS=num_heads,
+            PADDED_DIM=padded_dim,
+            HEAD_DIM=head_dim,
+            SCALE=hadamard.scale,
+            OUTPUT_BF16=1 if output_bf16 else 0,
+        )
+
+
+@triton.jit
+def _fused_gather_unpack_norm_3bit_kernel(
+    packed_ptr,          # [pool, heads, packed_dim] uint8 (3-bit packed)
+    norms_ptr,           # [pool, heads] float32
+    indices_ptr,         # [N] int32
+    centroids_ptr,       # [8] float32 (pre-scaled)
+    output_ptr,          # (N * heads, padded_dim) float32
+    packed_stride_tok,
+    packed_stride_head,
+    norms_stride_tok,
+    NUM_HEADS: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,    # = padded_dim * 3 // 8
+    NUM_GROUPS: tl.constexpr,    # = padded_dim // 8
+):
+    """Fused: gather → unpack 3-bit → centroid → norm. Grid: (N, NUM_HEADS)."""
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pool_pos = tl.load(indices_ptr + tok_idx)
+    norm = tl.load(norms_ptr + pool_pos * norms_stride_tok + head_idx)
+
+    base = pool_pos * packed_stride_tok + head_idx * packed_stride_head
+    out_row = tok_idx * NUM_HEADS + head_idx
+
+    # Process 8 coords per group (3 bytes → 8 × 3-bit indices)
+    for g in tl.static_range(NUM_GROUPS):
+        byte_off = g * 3
+        b0 = tl.load(packed_ptr + base + byte_off).to(tl.int32)
+        b1 = tl.load(packed_ptr + base + byte_off + 1).to(tl.int32)
+        b2 = tl.load(packed_ptr + base + byte_off + 2).to(tl.int32)
+        packed_24 = b0 | (b1 << 8) | (b2 << 16)
+
+        coord_base = g * 8
+        for k in tl.static_range(8):
+            idx = (packed_24 >> (k * 3)) & 0x07
+            val = tl.load(centroids_ptr + idx) * norm
+            if coord_base + k < PADDED_DIM:
+                tl.store(output_ptr + out_row * PADDED_DIM + coord_base + k, val)
+
+
+def turboquant_dequant_fused_mixed(
+    packed: torch.Tensor,
+    norms: torch.Tensor,
+    indices: torch.Tensor,
+    hadamard_hi: "HadamardTransform",
+    hadamard_lo: "HadamardTransform",
+    scaled_centroids_hi: torch.Tensor,
+    scaled_centroids_lo: torch.Tensor,
+    workspace: torch.Tensor,
+    head_dim: int,
+    split_dim: int,
+    bits_hi: int,
+    bits_lo: int,
+):
+    """Fused dequant for mixed-precision (e.g. 3.5-bit = 4-bit hi + 3-bit lo).
+
+    Processes hi and lo halves independently through:
+    1. Triton: gather + unpack + centroid + norm
+    2. CUDA Hadamard
+    3. Triton: signs + scale + scatter
+    """
+    n_active = indices.shape[0]
+    num_heads = packed.shape[1]
+    padded_hi = _next_power_of_2(split_dim)
+    padded_lo = _next_power_of_2(head_dim - split_dim)
+    packed_dim_hi = compute_packed_dim(padded_hi, bits_hi)
+    packed_dim_lo = compute_packed_dim(padded_lo, bits_lo)
+    device = packed.device
+    output_bf16 = workspace.dtype in (torch.bfloat16, torch.float16)
+
+    # ── Hi half (4-bit) ──
+    flat_hi = torch.empty(n_active * num_heads, padded_hi,
+                          dtype=torch.float32, device=device)
+
+    # Create a view into just the hi portion of packed buffer
+    packed_hi_view = packed[:, :, :packed_dim_hi].contiguous()
+    norms_hi = norms[:, :, 0].contiguous()
+
+    _fused_gather_unpack_norm_4bit_kernel[(n_active, num_heads)](
+        packed_hi_view, norms_hi, indices, scaled_centroids_hi, flat_hi,
+        packed_hi_view.stride(0), packed_hi_view.stride(1),
+        norms_hi.stride(0),
+        NUM_HEADS=num_heads,
+        PADDED_DIM=padded_hi,
+        PACKED_DIM=packed_dim_hi,
+    )
+
+    flat_hi = hadamard_hi._apply_hadamard(flat_hi)
+
+    # ── Lo half (3-bit) ──
+    flat_lo = torch.empty(n_active * num_heads, padded_lo,
+                          dtype=torch.float32, device=device)
+
+    packed_lo_view = packed[:, :, packed_dim_hi:packed_dim_hi + packed_dim_lo].contiguous()
+    norms_lo = norms[:, :, 1].contiguous()
+
+    if bits_lo == 4:
+        _fused_gather_unpack_norm_4bit_kernel[(n_active, num_heads)](
+            packed_lo_view, norms_lo, indices, scaled_centroids_lo, flat_lo,
+            packed_lo_view.stride(0), packed_lo_view.stride(1),
+            norms_lo.stride(0),
+            NUM_HEADS=num_heads,
+            PADDED_DIM=padded_lo,
+            PACKED_DIM=packed_dim_lo,
+        )
+    elif bits_lo == 3:
+        num_groups = padded_lo // 8
+        _fused_gather_unpack_norm_3bit_kernel[(n_active, num_heads)](
+            packed_lo_view, norms_lo, indices, scaled_centroids_lo, flat_lo,
+            packed_lo_view.stride(0), packed_lo_view.stride(1),
+            norms_lo.stride(0),
+            NUM_HEADS=num_heads,
+            PADDED_DIM=padded_lo,
+            PACKED_DIM=packed_dim_lo,
+            NUM_GROUPS=num_groups,
+        )
+    elif bits_lo == 2:
+        # 2-bit: unpack via PyTorch (rare path, can fuse later)
+        sel = packed_lo_view[indices]
+        flat_packed_lo = sel.reshape(-1, packed_dim_lo)
+        unpacked = unpack_indices(flat_packed_lo, 2, padded_lo)
+        c = scaled_centroids_lo
+        flat_lo = c[unpacked.long()] * norms_lo[indices].reshape(-1, 1)
+
+    flat_lo = hadamard_lo._apply_hadamard(flat_lo)
+
+    # ── Scatter both halves to workspace ──
+    _fused_signs_scatter_kernel[(n_active, num_heads)](
+        flat_hi, hadamard_hi.signs, indices, workspace,
+        workspace.stride(0), workspace.stride(1),
+        NUM_HEADS=num_heads,
+        PADDED_DIM=padded_hi,
+        HEAD_DIM=split_dim,
+        SCALE=hadamard_hi.scale,
+        OUTPUT_BF16=1 if output_bf16 else 0,
+    )
+
+    # Lo half writes to workspace offset by split_dim
+    # Need a separate scatter kernel that writes at an offset
+    _fused_signs_scatter_offset_kernel[(n_active, num_heads)](
+        flat_lo, hadamard_lo.signs, indices, workspace,
+        workspace.stride(0), workspace.stride(1),
+        NUM_HEADS=num_heads,
+        PADDED_DIM=padded_lo,
+        HEAD_DIM=head_dim - split_dim,
+        OFFSET=split_dim,
+        SCALE=hadamard_lo.scale,
+        OUTPUT_BF16=1 if output_bf16 else 0,
+    )
+
+
+@triton.jit
+def _fused_signs_scatter_offset_kernel(
+    input_ptr,
+    signs_ptr,
+    indices_ptr,
+    output_ptr,
+    output_stride_tok,
+    output_stride_head,
+    NUM_HEADS: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    OFFSET: tl.constexpr,
+    SCALE: tl.constexpr,
+    OUTPUT_BF16: tl.constexpr,
+):
+    """Same as _fused_signs_scatter_kernel but writes at OFFSET in workspace."""
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    in_row = tok_idx * NUM_HEADS + head_idx
+    offs = tl.arange(0, PADDED_DIM)
+    mask = offs < HEAD_DIM
+
+    vals = tl.load(input_ptr + in_row * PADDED_DIM + offs, mask=offs < PADDED_DIM, other=0.0)
+    signs = tl.load(signs_ptr + offs, mask=offs < PADDED_DIM, other=1.0)
+    vals = vals * SCALE * signs
+
+    pool_pos = tl.load(indices_ptr + tok_idx)
+    out_base = pool_pos * output_stride_tok + head_idx * output_stride_head + OFFSET
+
+    if OUTPUT_BF16:
+        tl.store(output_ptr + out_base + offs, vals.to(tl.bfloat16), mask=mask)
+    else:
+        tl.store(output_ptr + out_base + offs, vals, mask=mask)
+
+
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------

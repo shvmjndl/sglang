@@ -9,6 +9,8 @@ Reads use selective dequantization: only the active token positions
 This gives O(active_tokens) reads with real memory savings (~3.76x at 4-bit).
 """
 
+import math
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -17,11 +19,14 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.quantization.turboquant_kernels import (
     HadamardTransform,
+    _get_centroids_tensor,
     _next_power_of_2,
     compute_packed_dim,
     compute_packed_dim_mixed,
     initialize_centroids_cache,
     parse_bits,
+    turboquant_dequant_fused,
+    turboquant_dequant_fused_mixed,
     turboquant_dequantize,
     turboquant_dequantize_mixed,
     turboquant_quantize,
@@ -117,6 +122,18 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         # Active indices: set by attention backend before get_kv_buffer
         self._active_indices: Optional[torch.Tensor] = None
 
+        # Rotated-domain mode: skip Hadamard inverse in dequant, instead
+        # the attention backend rotates Q and output. Eliminates N×layers
+        # Hadamard transforms, replacing with 2 per layer on single vectors.
+        # Rotated-domain: skip Hadamard in dequant, rotate Q/output instead.
+        # Faster for long contexts (1000+ tokens) but slower for short ones
+        # due to Q/output rotation overhead on GQA models (many Q heads).
+        # Disabled by default; enable via environment variable for long-context workloads.
+        self._rotated_domain = (
+            not self.is_mixed and self.mode == "mse"
+            and os.environ.get("TURBOQUANT_ROTATED_DOMAIN", "0") == "1"
+        )
+
         # TurboQuant uses compressed buffers incompatible with the
         # parent's Triton-based kv_cache_copy (which expects contiguous bf16).
         super().__init__(
@@ -136,6 +153,24 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         )
 
         initialize_centroids_cache(torch_device)
+
+        # Pre-scaled centroids for fused dequant path (centroids / sqrt(d))
+        if self.is_mixed:
+            k_split_padded = _next_power_of_2(self._k_split_dim)
+            k_lo_padded = _next_power_of_2(head_dim - self._k_split_dim)
+            v_split_padded = _next_power_of_2(self._v_split_dim)
+            v_lo_padded = _next_power_of_2(effective_v - self._v_split_dim)
+            c_hi = _get_centroids_tensor(self.bits_hi, torch_device)
+            c_lo = _get_centroids_tensor(self.bits_lo, torch_device)
+            self._k_scaled_centroids_hi = c_hi / math.sqrt(k_split_padded)
+            self._k_scaled_centroids_lo = c_lo / math.sqrt(k_lo_padded)
+            self._v_scaled_centroids_hi = c_hi / math.sqrt(v_split_padded)
+            self._v_scaled_centroids_lo = c_lo / math.sqrt(v_lo_padded)
+        elif self.mode == "mse":
+            bits_int = int(self.bits)
+            c = _get_centroids_tensor(bits_int, torch_device)
+            self._k_scaled_centroids = c / math.sqrt(self.padded_head_dim)
+            self._v_scaled_centroids = c / math.sqrt(self.v_padded_head_dim)
 
     def _create_buffers(self):
         """Allocate compressed storage + shared workspace."""
@@ -262,13 +297,99 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         """
         self._active_indices = indices
 
+    # ── Rotated-domain attention: Q rotation + output de-rotation ──
+
+    def rotate_q(self, q: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """Rotate Q into the Hadamard domain for rotated-domain attention.
+
+        Math: q_rot = forward_k(q) = (1/√d) * H * S_k * q.
+        Then: q^T @ k_original = q_rot^T @ k_stored, because
+        k_stored = (scaled_centroids * norm) and k_original = inverse(k_stored).
+        """
+        if not self._rotated_domain:
+            return q
+        return self.k_hadamard.forward(q.float()).to(q.dtype)
+
+    def rotate_output(self, o: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """De-rotate attention output from the Hadamard domain.
+
+        Math: output = inverse_v(output_rot).
+        Because v_original = inverse_v(v_stored), linearity gives
+        sum(alpha_i * v_original_i) = inverse_v(sum(alpha_i * v_stored_i)).
+        """
+        if not self._rotated_domain:
+            return o
+        return self.v_hadamard.inverse(o.float()).to(o.dtype)
+
     # ── Read path: selective dequant into shared workspace ──
 
     def _dequant_positions(self, layer_id: int, which: str):
-        """Dequant active positions for one layer into the shared workspace."""
+        """Dequant active positions for one layer into the shared workspace.
+
+        Uses direct indexing (no torch.unique) so all ops have fixed shapes
+        determined by len(indices). Duplicate indices produce redundant but
+        correct writes — same data to same position.
+
+        For 4-bit MSE mode, uses the fused path (3 kernels instead of 6+).
+        """
         idx = layer_id - self.start_layer
         indices = self._active_indices
 
+        # Rotated-domain path: skip Hadamard inverse in dequant.
+        # Q is pre-rotated and output is post-rotated by the attention backend.
+        if self._rotated_domain:
+            if which == "k":
+                turboquant_dequant_fused(
+                    self.k_buffer[idx], self.k_norms_buffer[idx],
+                    indices, self.k_hadamard, self._k_scaled_centroids,
+                    self._k_ws, self.head_dim, self.padded_head_dim,
+                    skip_hadamard=True,
+                )
+            else:
+                turboquant_dequant_fused(
+                    self.v_buffer[idx], self.v_norms_buffer[idx],
+                    indices, self.v_hadamard, self._v_scaled_centroids,
+                    self._v_ws, self.v_head_dim, self.v_padded_head_dim,
+                    skip_hadamard=True,
+                )
+            return
+
+        # Full dequant path (with Hadamard inverse)
+        if self.is_mixed:
+            if which == "k":
+                turboquant_dequant_fused_mixed(
+                    self.k_buffer[idx], self.k_norms_buffer[idx],
+                    indices, self.k_hadamard_hi, self.k_hadamard_lo,
+                    self._k_scaled_centroids_hi, self._k_scaled_centroids_lo,
+                    self._k_ws, self.head_dim, self._k_split_dim,
+                    self.bits_hi, self.bits_lo,
+                )
+            else:
+                turboquant_dequant_fused_mixed(
+                    self.v_buffer[idx], self.v_norms_buffer[idx],
+                    indices, self.v_hadamard_hi, self.v_hadamard_lo,
+                    self._v_scaled_centroids_hi, self._v_scaled_centroids_lo,
+                    self._v_ws, self.v_head_dim, self._v_split_dim,
+                    self.bits_hi, self.bits_lo,
+                )
+            return
+
+        if self.mode == "mse":
+            if which == "k":
+                turboquant_dequant_fused(
+                    self.k_buffer[idx], self.k_norms_buffer[idx],
+                    indices, self.k_hadamard, self._k_scaled_centroids,
+                    self._k_ws, self.head_dim, self.padded_head_dim,
+                )
+            else:
+                turboquant_dequant_fused(
+                    self.v_buffer[idx], self.v_norms_buffer[idx],
+                    indices, self.v_hadamard, self._v_scaled_centroids,
+                    self._v_ws, self.v_head_dim, self.v_padded_head_dim,
+                )
+            return
+
+        # Fallback path for prod mode
         if which == "k":
             packed = self.k_buffer[idx]
             norms = self.k_norms_buffer[idx]
@@ -280,12 +401,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             ws = self._v_ws
             out_dim = self.v_head_dim
 
-        unique_indices = torch.unique(indices)
-        sel_packed = packed[unique_indices]   # (n_active, heads, packed_dim)
-        sel_norms = norms[unique_indices]     # (n_active, heads) or (n_active, heads, 2)
-        n_active = unique_indices.shape[0]
+        sel_packed = packed[indices]   # (n, heads, packed_dim)
+        sel_norms = norms[indices]     # (n, heads) or (n, heads, 2)
+        n = indices.shape[0]
 
-        # Flatten for dequant: (n_active * heads, packed_dim)
+        # Flatten for dequant: (n * heads, packed_dim)
         flat_packed = sel_packed.reshape(-1, sel_packed.shape[-1])
 
         if self.is_mixed:
@@ -315,17 +435,16 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                 "norms": flat_norms,
                 "padded_dim": self.padded_head_dim if which == "k" else self.v_padded_head_dim,
             }
-            # Include QJL buffers for prod mode
             if self.mode == "prod":
                 qjl_buf = self.k_qjl_buffer[idx] if which == "k" else self.v_qjl_buffer[idx]
                 res_buf = self.k_residual_norms_buffer[idx] if which == "k" else self.v_residual_norms_buffer[idx]
-                q["qjl_signs"] = qjl_buf[unique_indices].reshape(-1, qjl_buf.shape[-1])
-                q["residual_norms"] = res_buf[unique_indices].reshape(-1)
+                q["qjl_signs"] = qjl_buf[indices].reshape(-1, qjl_buf.shape[-1])
+                q["residual_norms"] = res_buf[indices].reshape(-1)
             h = self.k_hadamard if which == "k" else self.v_hadamard
             recon = turboquant_dequantize(q, h, int(self.bits), self.mode, self.dtype)
 
-        recon = recon[:, :out_dim].reshape(n_active, self.head_num, out_dim)
-        ws[unique_indices] = recon
+        recon = recon[:, :out_dim].reshape(n, self.head_num, out_dim)
+        ws[indices] = recon
 
     def _get_key_buffer(self, layer_id: int):
         """Dequant active positions into shared workspace and return it."""
