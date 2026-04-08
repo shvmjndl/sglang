@@ -1108,6 +1108,7 @@ class PerRequestVisualCache:
         self.rank_v = rank_v
         self.is_compressed = False
         self.steps_since_compress = 0
+        # Final resolved visual slots after prefix-cache remap has stabilized.
         self.visual_slot_indices: Optional[torch.Tensor] = None
         self._orig_dtype = None
         self._quantized = False
@@ -1212,6 +1213,41 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
     def get_visual_cache(self, req_pool_idx: int) -> Optional[PerRequestVisualCache]:
         return self.visual_caches.get(int(req_pool_idx))
 
+    def resolve_visual_slots(
+        self,
+        req_to_token_row: torch.Tensor,
+        visual_token_positions: Optional[torch.Tensor],
+        prompt_len: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """Resolve canonical visual token positions to the request's current slots.
+
+        This helper must be called only after prefix-cache finalization has
+        updated req_to_token_pool for the request. It converts request-local
+        visual token positions into the physical KV slots used by decode.
+        """
+        if visual_token_positions is None or len(visual_token_positions) == 0:
+            return None
+
+        if prompt_len is None:
+            prompt_len = req_to_token_row.shape[0]
+        if prompt_len <= 0:
+            return None
+
+        if req_to_token_row.device != visual_token_positions.device:
+            visual_token_positions = visual_token_positions.to(req_to_token_row.device)
+
+        visual_token_positions = visual_token_positions[
+            visual_token_positions < prompt_len
+        ]
+        if len(visual_token_positions) == 0:
+            return None
+
+        return (
+            req_to_token_row[:prompt_len][visual_token_positions]
+            .to(device=self.device, dtype=torch.int64)
+            .clone()
+        )
+
     def compress_visual_tokens(
         self,
         layer_id: int,
@@ -1232,6 +1268,9 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         if vis_cache is None or len(visual_slot_indices) == 0:
             return
 
+        visual_slot_indices = visual_slot_indices.to(
+            device=self.device, dtype=torch.int64
+        )
         T_v = len(visual_slot_indices)
         l = layer_id - self.start_layer
 
@@ -1266,7 +1305,7 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         vis_cache.importance[l] = torch.zeros(
             T_v, dtype=torch.float32, device=self.device
         )
-        vis_cache.visual_slot_indices = visual_slot_indices
+        vis_cache.visual_slot_indices = visual_slot_indices.clone()
         vis_cache.is_compressed = True
 
     def decompress_kv(
@@ -1360,7 +1399,7 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             return
 
         l = layer_id - self.start_layer
-        slots = vis_cache.visual_slot_indices
+        slots = vis_cache.visual_slot_indices.to(device=self.device, dtype=torch.int64)
 
         # Write decompressed KV back to the standard buffer
         if self.store_dtype != self.dtype:
@@ -1405,6 +1444,9 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
     ):
         """Compress visual tokens across all layers for a request.
         Called after prefill completes."""
+        visual_slot_indices = visual_slot_indices.to(
+            device=self.device, dtype=torch.int64
+        )
         vis_cache = self.alloc_visual_cache(
             req_pool_idx, len(visual_slot_indices)
         )

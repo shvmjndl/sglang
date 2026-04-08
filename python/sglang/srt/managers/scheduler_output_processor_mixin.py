@@ -166,14 +166,6 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    # AttentionPack: trigger SVD compression now that prefill is fully done
-                    # (including all chunks for chunked prefill)
-                    if (
-                        req.svd_accumulated_visual_slots is not None
-                        and len(req.svd_accumulated_visual_slots) > 0
-                    ):
-                        self._svd_compress_after_prefill(req)
-
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -186,6 +178,11 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
+
+                    if not req.finished():
+                        # Run compression only after prefix-cache finalization so
+                        # visual slots reflect the request's current shared mapping.
+                        self._svd_compress_after_prefill(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -1220,11 +1217,11 @@ class SchedulerOutputProcessorMixin:
         """Trigger SVD compression of visual tokens after a request's prefill completes.
 
         Called from process_batch_result_prefill when req.is_chunked <= 0,
-        ensuring all chunks (including chunked prefill) have been processed
-        and all visual token KV data is in the pool.
+        after any prefix-cache remap has updated req_to_token_pool.
 
-        This addresses the chunked prefill concern: compression only fires
-        once ALL chunks are done, not after each chunk.
+        The canonical visual identity is request-local token positions. We only
+        resolve them into physical slots once the request's prompt mapping has
+        stabilized for decode.
         """
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
 
@@ -1235,14 +1232,24 @@ class SchedulerOutputProcessorMixin:
         if not isinstance(kv_pool, MHATokenToKVPoolSVD):
             return
 
-        visual_slots = req.svd_accumulated_visual_slots
-        if visual_slots is None or len(visual_slots) == 0:
+        if req.visual_token_positions is None:
+            req.compute_visual_token_positions()
+
+        visual_positions = req.visual_token_positions
+        if visual_positions is None or len(visual_positions) == 0:
             return
 
-        # Move to GPU if stored on CPU (accumulated across chunks)
-        device = kv_pool.device
-        if visual_slots.device.type != device:
-            visual_slots = visual_slots.to(device)
+        prompt_len = len(req.origin_input_ids)
+        req_to_token_row = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prompt_len
+        ]
+        visual_slots = kv_pool.resolve_visual_slots(
+            req_to_token_row=req_to_token_row,
+            visual_token_positions=visual_positions,
+            prompt_len=prompt_len,
+        )
+        if visual_slots is None or len(visual_slots) == 0:
+            return
 
         # Compression is synchronous (blocks until SVD completes on GPU).
         # This is intentional: the scheduler loop is sequential, so compression

@@ -632,11 +632,9 @@ class Req(ReqDllmMixin):
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
 
-        # AttentionPack: positions of visual tokens in the input sequence
-        # Computed during prefill to identify which KV cache slots to compress
+        # AttentionPack: canonical visual token identity for this request.
+        # These positions stay stable even if prefix-cache remaps slot indices.
         self.visual_token_positions: Optional[torch.Tensor] = None
-        # Accumulated visual slot indices across chunked prefill chunks
-        self.svd_accumulated_visual_slots: Optional[torch.Tensor] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -1173,7 +1171,6 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
-        self.svd_accumulated_visual_slots = None  # Clear stale SVD state on retraction
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1733,10 +1730,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
-        # AttentionPack: compute visual token slot indices for SVD compression
-        if get_global_server_args().enable_svd_kv_cache:
-            self._compute_svd_visual_slot_indices(reqs, prefix_lens, out_cache_loc)
-
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
@@ -1769,55 +1762,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
-
-    def _compute_svd_visual_slot_indices(self, reqs, prefix_lens, out_cache_loc):
-        """Compute which KV cache slot indices correspond to visual tokens.
-
-        Maps visual token positions in the input sequence to their allocated
-        KV pool slot indices for SVD compression.
-        """
-        svd_visual_slot_indices = []
-        offset = 0
-        for i, req in enumerate(reqs):
-            extend_len = req.extend_input_len
-            pre_len = prefix_lens[i]
-
-            # Compute visual positions if not done yet
-            if req.visual_token_positions is None:
-                req.compute_visual_token_positions()
-
-            chunk_visual_slots = None
-            if req.visual_token_positions is not None and len(req.visual_token_positions) > 0:
-                vp = req.visual_token_positions
-                # Visual positions that fall in this extend range (current chunk)
-                in_range = (vp >= pre_len) & (vp < pre_len + extend_len)
-                visual_pos_local = vp[in_range] - pre_len
-
-                if len(visual_pos_local) > 0:
-                    # Map to cache slot indices
-                    chunk_visual_slots = out_cache_loc[offset + visual_pos_local].clone()
-
-            # Accumulate across chunks for chunked prefill
-            if chunk_visual_slots is not None:
-                if req.svd_accumulated_visual_slots is not None:
-                    req.svd_accumulated_visual_slots = torch.cat([
-                        req.svd_accumulated_visual_slots,
-                        chunk_visual_slots.cpu(),
-                    ])
-                else:
-                    req.svd_accumulated_visual_slots = chunk_visual_slots.cpu()
-
-            # Return the FULL accumulated set (all chunks so far)
-            if req.svd_accumulated_visual_slots is not None:
-                svd_visual_slot_indices.append(
-                    req.svd_accumulated_visual_slots.to(out_cache_loc.device)
-                )
-            else:
-                svd_visual_slot_indices.append(None)
-
-            offset += extend_len
-
-        self.svd_visual_slot_indices = svd_visual_slot_indices
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,

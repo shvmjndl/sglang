@@ -291,6 +291,59 @@ class TestPerRequestVisualCache(unittest.TestCase):
             self.assertEqual(vis_cache.k_decomp[l].shape, (32, 32 * 128))
 
 
+class TestFinalVisualSlotResolution(unittest.TestCase):
+    """Test resolving final visual slots from the current req_to_token mapping."""
+
+    def _make_pool(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+
+        return MHATokenToKVPoolSVD(
+            size=128,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=4,
+            head_dim=8,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            rank_k=4,
+            rank_v=4,
+        )
+
+    def test_resolve_visual_slots_after_remap(self):
+        """Visual slots should come from the remapped req_to_token row."""
+        pool = self._make_pool()
+
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 21, 200, 201], dtype=torch.int32)
+
+        resolved = pool.resolve_visual_slots(
+            req_to_token_row=req_to_token_row,
+            visual_token_positions=visual_positions,
+            prompt_len=4,
+        )
+
+        self.assertTrue(torch.equal(resolved, torch.tensor([21, 201], dtype=torch.int64)))
+
+    def test_compress_all_layers_uses_final_visual_slots(self):
+        """The per-request cache should store the final resolved visual slots."""
+        pool = self._make_pool()
+
+        req_pool_idx = 0
+        final_slots = torch.tensor([5, 9], dtype=torch.int64)
+        k_data = torch.randn(2, 4, 8, dtype=torch.float16)
+        v_data = torch.randn(2, 4, 8, dtype=torch.float16)
+
+        pool.k_buffer[0][final_slots] = k_data.to(pool.store_dtype)
+        pool.v_buffer[0][final_slots] = v_data.to(pool.store_dtype)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        self.assertTrue(vis_cache.is_compressed)
+        self.assertTrue(torch.equal(vis_cache.visual_slot_indices, final_slots))
+
+
 class TestFusedKernel(unittest.TestCase):
     """Test fused Triton kernel correctness against reference implementation."""
 
