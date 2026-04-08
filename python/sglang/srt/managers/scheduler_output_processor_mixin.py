@@ -166,6 +166,14 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # AttentionPack: trigger SVD compression now that prefill is fully done
+                    # (including all chunks for chunked prefill)
+                    if (
+                        req.svd_accumulated_visual_slots is not None
+                        and len(req.svd_accumulated_visual_slots) > 0
+                    ):
+                        self._svd_compress_after_prefill(req)
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -1207,3 +1215,38 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts=retraction_counts,
             )
         )
+
+    def _svd_compress_after_prefill(self: Scheduler, req: Req):
+        """Trigger SVD compression of visual tokens after a request's prefill completes.
+
+        Called from process_batch_result_prefill when req.is_chunked <= 0,
+        ensuring all chunks (including chunked prefill) have been processed
+        and all visual token KV data is in the pool.
+
+        This addresses the chunked prefill concern: compression only fires
+        once ALL chunks are done, not after each chunk.
+        """
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+
+        allocator = self.token_to_kv_pool_allocator
+        if not hasattr(allocator, "get_kvcache"):
+            return
+        kv_pool = allocator.get_kvcache()
+        if not isinstance(kv_pool, MHATokenToKVPoolSVD):
+            return
+
+        visual_slots = req.svd_accumulated_visual_slots
+        if visual_slots is None or len(visual_slots) == 0:
+            return
+
+        # Move to GPU if stored on CPU (accumulated across chunks)
+        device = kv_pool.device
+        if visual_slots.device.type != device:
+            visual_slots = visual_slots.to(device)
+
+        # Compression is synchronous (blocks until SVD completes on GPU).
+        # This is intentional: the scheduler loop is sequential, so compression
+        # must finish before get_next_batch_to_run() can schedule this request
+        # for decode. A future optimization could use async compression with a
+        # "compression pending" flag to avoid blocking the scheduler hot path.
+        kv_pool.compress_all_layers(req.req_pool_idx, visual_slots)

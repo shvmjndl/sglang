@@ -632,6 +632,12 @@ class Req(ReqDllmMixin):
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
 
+        # AttentionPack: positions of visual tokens in the input sequence
+        # Computed during prefill to identify which KV cache slots to compress
+        self.visual_token_positions: Optional[torch.Tensor] = None
+        # Accumulated visual slot indices across chunked prefill chunks
+        self.svd_accumulated_visual_slots: Optional[torch.Tensor] = None
+
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
@@ -859,6 +865,45 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
+
+    def compute_visual_token_positions(self):
+        """Identify visual token positions from input_ids for AttentionPack SVD compression.
+
+        Matches placeholder token IDs (im_token_id, video_token_id) AND
+        pad_value-hashed token IDs (>= MM_PAD_SHIFT_VALUE) in origin_input_ids
+        to determine which positions in the KV cache correspond to visual tokens.
+        """
+        if self.multimodal_inputs is None:
+            self.visual_token_positions = None
+            return
+
+        mm = self.multimodal_inputs
+        input_ids = self.origin_input_ids
+
+        # Collect known multimodal placeholder token IDs
+        mm_token_ids = set()
+        if mm.im_token_id is not None:
+            mm_token_ids.add(mm.im_token_id)
+        if mm.video_token_id is not None:
+            mm_token_ids.add(mm.video_token_id)
+        if mm.audio_token_id is not None:
+            mm_token_ids.add(mm.audio_token_id)
+
+        visual_positions = []
+        for i, tid in enumerate(input_ids):
+            if tid in mm_token_ids:
+                visual_positions.append(i)
+            elif tid >= MM_PAD_SHIFT_VALUE:
+                # Pad-value hashed tokens (used by some multimodal processors)
+                # These are image/video patch tokens with shifted IDs
+                visual_positions.append(i)
+
+        if visual_positions:
+            self.visual_token_positions = torch.tensor(
+                visual_positions, dtype=torch.int64
+            )
+        else:
+            self.visual_token_positions = None
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -1128,6 +1173,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
+        self.svd_accumulated_visual_slots = None  # Clear stale SVD state on retraction
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1687,6 +1733,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
+        # AttentionPack: compute visual token slot indices for SVD compression
+        if get_global_server_args().enable_svd_kv_cache:
+            self._compute_svd_visual_slot_indices(reqs, prefix_lens, out_cache_loc)
+
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
@@ -1719,6 +1769,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+    def _compute_svd_visual_slot_indices(self, reqs, prefix_lens, out_cache_loc):
+        """Compute which KV cache slot indices correspond to visual tokens.
+
+        Maps visual token positions in the input sequence to their allocated
+        KV pool slot indices for SVD compression.
+        """
+        svd_visual_slot_indices = []
+        offset = 0
+        for i, req in enumerate(reqs):
+            extend_len = req.extend_input_len
+            pre_len = prefix_lens[i]
+
+            # Compute visual positions if not done yet
+            if req.visual_token_positions is None:
+                req.compute_visual_token_positions()
+
+            chunk_visual_slots = None
+            if req.visual_token_positions is not None and len(req.visual_token_positions) > 0:
+                vp = req.visual_token_positions
+                # Visual positions that fall in this extend range (current chunk)
+                in_range = (vp >= pre_len) & (vp < pre_len + extend_len)
+                visual_pos_local = vp[in_range] - pre_len
+
+                if len(visual_pos_local) > 0:
+                    # Map to cache slot indices
+                    chunk_visual_slots = out_cache_loc[offset + visual_pos_local].clone()
+
+            # Accumulate across chunks for chunked prefill
+            if chunk_visual_slots is not None:
+                if req.svd_accumulated_visual_slots is not None:
+                    req.svd_accumulated_visual_slots = torch.cat([
+                        req.svd_accumulated_visual_slots,
+                        chunk_visual_slots.cpu(),
+                    ])
+                else:
+                    req.svd_accumulated_visual_slots = chunk_visual_slots.cpu()
+
+            # Return the FULL accumulated set (all chunks so far)
+            if req.svd_accumulated_visual_slots is not None:
+                svd_visual_slot_indices.append(
+                    req.svd_accumulated_visual_slots.to(out_cache_loc.device)
+                )
+            else:
+                svd_visual_slot_indices.append(None)
+
+            offset += extend_len
+
+        self.svd_visual_slot_indices = svd_visual_slot_indices
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -2324,6 +2423,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            svd_visual_slot_indices=getattr(self, "svd_visual_slot_indices", None),
         )
 
     def copy(self):
@@ -2513,6 +2613,9 @@ class ModelWorkerBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # AttentionPack: per-request visual token slot indices for SVD compression
+    svd_visual_slot_indices: Optional[List[Optional[torch.Tensor]]] = None
 
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64

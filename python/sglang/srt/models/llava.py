@@ -657,7 +657,10 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     ) -> Dict[str, str]:
         mapping = {}
         for config_cls in auto_model_type._model_mapping.keys():
-            archs = auto_model_type._model_mapping.get(config_cls, None)
+            try:
+                archs = auto_model_type._model_mapping.get(config_cls, None)
+            except (ValueError, ImportError, AttributeError):
+                continue
             if archs is not None:
                 if isinstance(archs, tuple):
                     mapping[config_cls.__name__] = tuple(

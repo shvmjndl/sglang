@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -147,6 +148,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+
+        # AttentionPack SVD config
+        self.svd_enabled = model_runner.server_args.enable_svd_kv_cache
+        self.svd_fused_kernel = model_runner.server_args.svd_fused_kernel
+        self.svd_head_dim = model_runner.model_config.head_dim
+        self.svd_num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -862,6 +871,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # NOTE: SVD compression is NOT triggered here. It is triggered from
+        # process_batch_result_prefill in scheduler_output_processor_mixin.py
+        # when req.is_chunked <= 0, ensuring all chunks are processed first.
+
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     @debug_kernel_api
@@ -890,16 +903,22 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        kv_pool = forward_batch.token_to_kv_pool
+
+        if self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD):
+            o = self._svd_forward_decode(
+                q, k, layer, forward_batch, decode_wrapper, kv_pool
+            )
+        else:
+            # Standard path
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -913,6 +932,277 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
+
+    # ---- AttentionPack SVD helpers ----
+    # NOTE: SVD compression after prefill is triggered from the scheduler
+    # (scheduler_output_processor_mixin.py::_svd_compress_after_prefill)
+    # when req.is_chunked <= 0, NOT from the attention backend.
+    # This correctly handles chunked prefill.
+
+    def _svd_forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        decode_wrapper,
+        kv_pool: MHATokenToKVPoolSVD,
+    ) -> torch.Tensor:
+        """Full SVD-aware decode path: decompress, attend, update scores, re-compress.
+
+        Implements Paper Algorithm 1 decode-phase logic:
+          1. Decompress compressed cache (non-fused or fused)
+          2. Run attention over decompressed + uncompressed KV
+          3. Update importance scores (EMA)
+          4. Periodically re-compress accumulated uncompressed tokens
+        """
+        layer_id = layer.layer_id
+        has_any_compressed = False
+
+        # Check if any request in the batch has compressed visual cache
+        for i in range(forward_batch.batch_size):
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            if vis_cache is not None and vis_cache.is_compressed:
+                has_any_compressed = True
+                break
+
+        if not has_any_compressed:
+            # No compressed caches — pure standard path
+            return decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                kv_pool.get_kv_buffer(layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+
+        # --- Non-fused path: decompress to slots, then use FlashInfer ---
+        # (Fused kernel path for per-request attention is below but requires
+        # single-request batching; for batched decode we use decompress-to-slots)
+
+        use_fused = (
+            self.svd_fused_kernel
+            and forward_batch.batch_size == 1
+            and layer.logit_cap in (0, None)
+        )
+
+        if use_fused:
+            o = self._svd_fused_decode_single(
+                q, layer, forward_batch, kv_pool
+            )
+
+        if not use_fused or o is None:
+            # Decompress visual KV back into the slot pool for all requests
+            for i in range(forward_batch.batch_size):
+                req_pool_idx = forward_batch.req_pool_indices[i].item()
+                kv_pool.write_decompressed_to_slots(layer_id, req_pool_idx)
+
+            # Standard FlashInfer paged attention over the now-populated slots
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                kv_pool.get_kv_buffer(layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+
+        # --- Update importance scores (Paper Eq. 1) ---
+        # Compute approximate attention weights for compressed tokens
+        # This is cheap for decode (T_q = 1)
+        self._svd_update_importance(
+            q, layer, forward_batch, kv_pool
+        )
+
+        # --- Periodic re-compression (Paper Algorithm 1, lines 14-17) ---
+        # Only check on the last layer to avoid redundant per-layer checks
+        if layer_id == kv_pool.start_layer + kv_pool.layer_num - 1:
+            self._svd_check_recompression(forward_batch, kv_pool)
+
+        return o
+
+    def _svd_fused_decode_single(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        kv_pool: MHATokenToKVPoolSVD,
+    ) -> torch.Tensor:
+        """Fused SVD decode attention for single-request batches.
+
+        Uses the custom Triton kernel that fuses decompression with attention,
+        avoiding materializing full-size K/V in HBM.
+        """
+        from sglang.srt.layers.attention.triton_ops.svd_decode_attention import (
+            svd_fused_decode_attention,
+        )
+
+        layer_id = layer.layer_id
+        req_pool_idx = forward_batch.req_pool_indices[0].item()
+        vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+
+        if vis_cache is None or not vis_cache.is_compressed:
+            # Fallback to standard path
+            return None  # caller will handle
+
+        l = layer_id - kv_pool.start_layer
+        k_bar = vis_cache.k_compressed[l]   # [T_c, R_k]
+        d_k = vis_cache.k_decomp[l]         # [R_k, HD]
+        v_bar = vis_cache.v_compressed[l]    # [T_c, R_v]
+        d_v = vis_cache.v_decomp[l]          # [R_v, HD]
+        importance = vis_cache.importance[l]  # [T_c]
+
+        # Gather uncompressed KV for this request's non-visual tokens
+        # These are the text tokens + recently generated decode tokens
+        seq_len = forward_batch.seq_lens[0].item()
+        req_pool_row = forward_batch.req_pool_indices[0].item()
+
+        # Get all slot indices for this request
+        all_slots = forward_batch.req_to_token_pool.req_to_token[req_pool_row][:seq_len]
+
+        # Visual slots are in compressed form — exclude them (GPU-native)
+        visual_slots = vis_cache.visual_slot_indices
+        if visual_slots is not None and len(visual_slots) > 0:
+            uncomp_mask = ~torch.isin(all_slots, visual_slots)
+            uncomp_slots = all_slots[uncomp_mask]
+        else:
+            uncomp_slots = all_slots
+
+        # Gather uncompressed K/V from the standard pool
+        k_uncomp = kv_pool._get_key_buffer(layer_id)[uncomp_slots]     # [T_u, H, D]
+        v_uncomp = kv_pool._get_value_buffer(layer_id)[uncomp_slots]   # [T_u, H, D]
+
+        q_shaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        o = svd_fused_decode_attention(
+            q=q_shaped,
+            k_bar=k_bar,
+            d_k=d_k,
+            v_bar=v_bar,
+            d_v=d_v,
+            k_uncomp=k_uncomp,
+            v_uncomp=v_uncomp,
+            importance=importance,
+            sm_scale=layer.scaling,
+        )
+
+        return o
+
+    def _svd_update_importance(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        kv_pool: MHATokenToKVPoolSVD,
+    ):
+        """Update importance scores for compressed tokens after attention.
+
+        Paper Eq. 1: I_tp ← α^Tq * I_tp + (1 - α^Tq) * avg_attn
+
+        Since FlashInfer doesn't return raw attention weights, we compute
+        approximate scores using q @ k_decompressed^T. This is cheap for
+        decode (T_q = 1, single matmul per request).
+        """
+        layer_id = layer.layer_id
+        q_shaped = q.contiguous().view(
+            forward_batch.batch_size, layer.tp_q_head_num, layer.head_dim
+        )
+
+        for i in range(forward_batch.batch_size):
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            if vis_cache is None or not vis_cache.is_compressed:
+                continue
+
+            l = layer_id - kv_pool.start_layer
+            if vis_cache.k_compressed[l] is None:
+                continue
+
+            # Read visual token keys from slots (already decompressed in non-fused path,
+            # avoids redundant decompress_kv call)
+            visual_slots = vis_cache.visual_slot_indices
+            if visual_slots is None or len(visual_slots) == 0:
+                continue
+
+            k_visual = kv_pool._get_key_buffer(layer_id)[visual_slots]  # [T_c, H_kv, D]
+            T_c = k_visual.shape[0]
+            H_kv = k_visual.shape[1]
+
+            # q_i: [H_q, D]
+            q_i = q_shaped[i]
+
+            # Map query heads to KV heads (GQA support)
+            heads_per_group = layer.tp_q_head_num // H_kv
+            q_kv = q_i[::heads_per_group] if heads_per_group > 1 else q_i  # [H_kv, D]
+
+            # Compute attention scores over ALL tokens (visual + uncompressed)
+            # to get properly normalized importance weights (BUG 13 fix)
+            seq_len = forward_batch.seq_lens[i].item()
+            req_row = forward_batch.req_pool_indices[i].item()
+            all_slots = forward_batch.req_to_token_pool.req_to_token[req_row][:seq_len]
+            k_all = kv_pool._get_key_buffer(layer_id)[all_slots]  # [T_total, H_kv, D]
+
+            # Full attention scores: [H_kv, T_total]
+            scores = torch.einsum("hd,thd->ht", q_kv.float(), k_all.float())
+            scores = scores * layer.scaling
+            attn_weights = torch.softmax(scores, dim=-1)  # [H_kv, T_total]
+
+            # Extract attention weights for visual token positions only
+            # visual_slots are pool slot indices; find their positions in all_slots
+            visual_positions = torch.isin(all_slots, visual_slots).nonzero(as_tuple=True)[0]
+            visual_attn = attn_weights[:, visual_positions]  # [H_kv, T_c]
+
+            # Average across heads → [T_c]
+            avg_importance = visual_attn.mean(dim=0)
+
+            kv_pool.update_importance_scores(
+                layer_id, req_pool_idx, avg_importance
+            )
+
+    def _svd_check_recompression(
+        self,
+        forward_batch: ForwardBatch,
+        kv_pool: MHATokenToKVPoolSVD,
+    ):
+        """Periodically re-compress visual tokens from current slot data.
+
+        Paper Algorithm 1, lines 14-17: After T_p decode steps, re-run SVD
+        on the visual token slots. This serves two purposes:
+          1. Refreshes the SVD factorization from the current (full-precision)
+             slot data, correcting drift from partial decompression approximation.
+          2. The updated importance scores inform better partial rank allocation
+             in subsequent decode steps.
+
+        Note: The paper also describes folding in newly generated decode tokens.
+        In this implementation, decode tokens remain in the standard uncompressed
+        pool (text tokens participate in radix caching). Re-compression here
+        refreshes the visual token SVD only.
+        """
+        for i in range(forward_batch.batch_size):
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            if vis_cache is None or not vis_cache.is_compressed:
+                continue
+
+            vis_cache.steps_since_compress += 1
+
+            if vis_cache.steps_since_compress >= kv_pool.compress_period:
+                vis_cache.steps_since_compress = 0
+
+                # Re-compress from current slot data. In the non-fused path,
+                # slots contain the most recent full-precision decompressed data
+                # (written by write_decompressed_to_slots earlier this step).
+                # Re-running SVD on this data refreshes the factorization.
+                if vis_cache.visual_slot_indices is not None:
+                    for layer_id in range(
+                        kv_pool.start_layer,
+                        kv_pool.start_layer + kv_pool.layer_num,
+                    ):
+                        kv_pool.compress_visual_tokens(
+                            layer_id, req_pool_idx, vis_cache.visual_slot_indices
+                        )
 
 
 class FlashInferIndicesUpdaterDecode:
