@@ -2455,6 +2455,7 @@ class Scheduler(
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
+            old_scratch_tokens = batch.visual_scratch_tokens_required_next_decode()
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
@@ -2492,6 +2493,7 @@ class Scheduler(
             if kv_full_retract_flag:
                 msg_details += (
                     f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
+                    f", #decode_scratch_tokens: {old_scratch_tokens}"
                 )
             logger.warning(msg_prefix + msg_details)
 

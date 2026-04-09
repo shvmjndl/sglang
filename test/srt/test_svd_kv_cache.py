@@ -15,6 +15,8 @@ Run with: python -m pytest test/srt/test_svd_kv_cache.py -v
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -294,20 +296,20 @@ class TestPerRequestVisualCache(unittest.TestCase):
 class TestFinalVisualSlotResolution(unittest.TestCase):
     """Test resolving final visual slots from the current req_to_token mapping."""
 
-    def _make_pool(self):
+    def _make_pool(self, size=128, head_num=4, head_dim=8, rank_k=4, rank_v=4):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
 
         return MHATokenToKVPoolSVD(
-            size=128,
+            size=size,
             page_size=1,
             dtype=torch.float16,
-            head_num=4,
-            head_dim=8,
+            head_num=head_num,
+            head_dim=head_dim,
             layer_num=1,
             device="cpu",
             enable_memory_saver=False,
-            rank_k=4,
-            rank_v=4,
+            rank_k=rank_k,
+            rank_v=rank_v,
         )
 
     def test_resolve_visual_slots_after_remap(self):
@@ -416,6 +418,52 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
 
         self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
         self.assertIsNone(vis_cache.visual_slot_indices)
+
+    def test_activate_visual_scratch_page_aligns_allocation(self):
+        """Scratch allocation should reserve whole pages while exposing only used slots."""
+        from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
+        pool = self._make_pool(size=64, head_num=4, head_dim=8, rank_k=4, rank_v=4)
+        pool.page_size = 4
+        allocator = PagedTokenToKVPoolAllocator(
+            size=64,
+            page_size=4,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        req_pool_idx = 0
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 0, 21, 0], dtype=torch.int32)
+        final_slots = torch.tensor([8, 9], dtype=torch.int64)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        vis_cache.visual_token_positions = visual_positions.clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.released_dense_visual_slots = True
+
+        scratch = pool.activate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertEqual(len(scratch), 2)
+        self.assertIsNotNone(vis_cache.scratch_slot_allocation)
+        self.assertEqual(len(vis_cache.scratch_slot_allocation), 4)
+        self.assertTrue(torch.equal(req_to_token_row[visual_positions], scratch.to(torch.int32)))
+
+        pool.deactivate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertIsNone(vis_cache.scratch_slot_allocation)
+        self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
 
     def test_compression_stats_report_released_and_scratch_state(self):
         """Compression stats should surface released/scratch state for debugging."""
@@ -567,6 +615,267 @@ class TestSVDRadixOwnership(unittest.TestCase):
         self.assertEqual(req.cache_protected_len, 0)
         self.assertEqual(tree.total_size(), 0)
         self.assertTrue(torch.equal(req.prefix_indices, kv_indices))
+
+
+class TestSVDDecodeScratchBudget(unittest.TestCase):
+    class _FakeKVPool:
+        def __init__(self, caches):
+            self._caches = caches
+
+        def get_visual_cache(self, req_pool_idx):
+            return self._caches.get(int(req_pool_idx))
+
+    class _FakeAllocator:
+        def __init__(self, available_size, page_size, kv_pool):
+            self._available_size = available_size
+            self.page_size = page_size
+            self._kv_pool = kv_pool
+
+        def available_size(self):
+            return self._available_size
+
+        def get_kvcache(self):
+            return self._kv_pool
+
+    class _DummyReq:
+        def __init__(self, req_pool_idx, output_len=0, prompt_len=0, max_new_tokens=16):
+            self.req_pool_idx = req_pool_idx
+            self.output_ids = [0] * output_len
+            self.origin_input_ids = [0] * prompt_len
+            self.kv_committed_len = 1
+            self.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+            self.rid = f"req-{req_pool_idx}"
+
+    def _enable_svd_args(self, page_size=1):
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        args = ServerArgs(model_path="dummy")
+        args.enable_svd_kv_cache = True
+        args.page_size = page_size
+        set_global_server_args_for_scheduler(args)
+
+    def _make_batch(self, reqs, allocator):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        batch = ScheduleBatch.__new__(ScheduleBatch)
+        batch.reqs = reqs
+        batch.token_to_kv_pool_allocator = allocator
+        batch.tree_cache = SimpleNamespace()
+        batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        batch.is_spec_v2 = False
+        return batch
+
+    def test_visual_scratch_tokens_required_next_decode(self):
+        self._enable_svd_args(page_size=4)
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        caches = {
+            0: SimpleNamespace(
+                is_compressed=True, released_dense_visual_slots=True, num_tokens=3
+            ),
+            1: SimpleNamespace(
+                is_compressed=True, released_dense_visual_slots=False, num_tokens=7
+            ),
+            2: SimpleNamespace(
+                is_compressed=False, released_dense_visual_slots=True, num_tokens=9
+            ),
+        }
+        allocator = self._FakeAllocator(
+            available_size=64, page_size=4, kv_pool=self._FakeKVPool(caches)
+        )
+        batch = self._make_batch(
+            [
+                self._DummyReq(0),
+                self._DummyReq(1),
+                self._DummyReq(2),
+                self._DummyReq(None),
+            ],
+            allocator,
+        )
+
+        self.assertEqual(
+            ScheduleBatch.visual_scratch_tokens_required_next_decode(batch),
+            4,
+        )
+
+    def test_check_decode_mem_accounts_for_visual_scratch(self):
+        self._enable_svd_args(page_size=4)
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        caches = {
+            0: SimpleNamespace(
+                is_compressed=True, released_dense_visual_slots=True, num_tokens=3
+            ),
+        }
+        allocator = self._FakeAllocator(
+            available_size=7, page_size=4, kv_pool=self._FakeKVPool(caches)
+        )
+        batch = self._make_batch([self._DummyReq(0)], allocator)
+        batch.new_tokens_required_next_decode = lambda selected_indices=None: 4
+
+        with patch(
+            "sglang.srt.managers.schedule_batch.evict_from_tree_cache"
+        ) as mock_evict:
+            self.assertFalse(ScheduleBatch.check_decode_mem(batch))
+            mock_evict.assert_called_once_with(batch.tree_cache, 8)
+
+    def test_retract_decode_can_make_progress_when_only_scratch_causes_oom(self):
+        self._enable_svd_args(page_size=4)
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        caches = {
+            0: SimpleNamespace(
+                is_compressed=True, released_dense_visual_slots=True, num_tokens=5
+            ),
+            1: SimpleNamespace(
+                is_compressed=True, released_dense_visual_slots=True, num_tokens=5
+            ),
+        }
+        allocator = self._FakeAllocator(
+            available_size=12, page_size=4, kv_pool=self._FakeKVPool(caches)
+        )
+        reqs = [
+            self._DummyReq(0, output_len=4, prompt_len=8, max_new_tokens=16),
+            self._DummyReq(1, output_len=1, prompt_len=4, max_new_tokens=16),
+        ]
+        batch = self._make_batch(reqs, allocator)
+        batch.new_tokens_required_next_decode = lambda selected_indices=None: 0
+        batch.release_req = lambda idx, remaining_req_count, server_args: None
+        def _filter_batch(keep_indices=None, **kwargs):
+            keep = keep_indices if keep_indices is not None else kwargs["keep_indices"]
+            batch.reqs = [batch.reqs[i] for i in keep]
+
+        batch.filter_batch = _filter_batch
+
+        with patch("sglang.srt.managers.schedule_batch.evict_from_tree_cache"):
+            retracted_reqs, _, reqs_to_abort = ScheduleBatch.retract_decode(
+                batch,
+                SimpleNamespace(speculative_algorithm=None),
+            )
+
+        self.assertEqual(len(retracted_reqs), 1)
+        self.assertEqual(len(reqs_to_abort), 0)
+        self.assertEqual(len(batch.reqs), 1)
+        self.assertEqual(batch.reqs[0].req_pool_idx, 1)
+
+
+class TestSVDDecodeScratchLifecycle(unittest.TestCase):
+    def _make_idle_forward_batch(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        return SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            batch_size=0,
+            token_to_kv_pool=None,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.empty((0, 0), dtype=torch.int32)
+            ),
+            seq_lens=torch.empty((0,), dtype=torch.int32),
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            seq_lens_sum=0,
+            encoder_lens=None,
+            spec_info=None,
+        )
+
+    def test_idle_init_forward_metadata_skips_scratch_activation(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            DecodeMetadata,
+            FlashInferAttnBackend,
+        )
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        backend._maybe_activate_svd_scratch = Mock(
+            side_effect=AssertionError("idle should not activate scratch")
+        )
+        backend.indices_updater_decode = SimpleNamespace(update=Mock())
+        backend.decode_wrappers = []
+        backend.decode_split_tile_size = None
+
+        forward_batch = self._make_idle_forward_batch()
+        backend.init_forward_metadata(forward_batch)
+
+        self.assertIsInstance(backend.forward_metadata, DecodeMetadata)
+        self.assertFalse(backend.forward_metadata.has_svd_scratch)
+        backend.indices_updater_decode.update.assert_called_once()
+
+    def test_idle_finish_forward_metadata_skips_scratch_cleanup(self):
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        backend.svd_enabled = True
+        backend.indices_updater_decode = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace()
+        )
+
+        forward_batch = self._make_idle_forward_batch()
+        backend.finish_forward_metadata(forward_batch)
+
+
+class TestSVDFusedDecodeVisualIdentity(unittest.TestCase):
+    def test_fused_single_uses_visual_positions_for_released_visual_cache(self):
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+
+        k_buffer = torch.zeros(16, 1, 2, dtype=torch.float16)
+        v_buffer = torch.zeros(16, 1, 2, dtype=torch.float16)
+        k_buffer[10, 0] = torch.tensor([10.0, 10.5], dtype=torch.float16)
+        k_buffer[11, 0] = torch.tensor([11.0, 11.5], dtype=torch.float16)
+        v_buffer[10, 0] = torch.tensor([20.0, 20.5], dtype=torch.float16)
+        v_buffer[11, 0] = torch.tensor([21.0, 21.5], dtype=torch.float16)
+
+        vis_cache = SimpleNamespace(
+            is_compressed=True,
+            k_compressed=[torch.zeros(2, 1, dtype=torch.float16)],
+            k_decomp=[torch.zeros(1, 2, dtype=torch.float16)],
+            v_compressed=[torch.zeros(2, 1, dtype=torch.float16)],
+            v_decomp=[torch.zeros(1, 2, dtype=torch.float16)],
+            importance=[torch.zeros(2, dtype=torch.float32)],
+            visual_token_positions=torch.tensor([1, 3], dtype=torch.int64),
+            visual_slot_indices=None,
+        )
+        kv_pool = SimpleNamespace(
+            start_layer=0,
+            get_visual_cache=lambda req_pool_idx: vis_cache,
+            _get_key_buffer=lambda layer_id: k_buffer,
+            _get_value_buffer=lambda layer_id: v_buffer,
+        )
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([4], dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[10, 0, 11, 0]], dtype=torch.int32)
+            ),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=1,
+            head_dim=2,
+            scaling=1.0,
+        )
+        q = torch.zeros(1, 1, 2, dtype=torch.float16)
+        captured = {}
+
+        def _fake_fused(q, k_bar, d_k, v_bar, d_v, k_uncomp, v_uncomp, importance, sm_scale):
+            captured["k_uncomp"] = k_uncomp.clone()
+            captured["v_uncomp"] = v_uncomp.clone()
+            return torch.zeros_like(q)
+
+        with patch(
+            "sglang.srt.layers.attention.triton_ops.svd_decode_attention.svd_fused_decode_attention",
+            side_effect=_fake_fused,
+        ):
+            out = backend._svd_fused_decode_single(q, layer, forward_batch, kv_pool)
+
+        self.assertTrue(torch.equal(out, torch.zeros_like(q)))
+        expected_k = k_buffer[torch.tensor([10, 11], dtype=torch.int64)]
+        expected_v = v_buffer[torch.tensor([10, 11], dtype=torch.int64)]
+        self.assertTrue(torch.equal(captured["k_uncomp"], expected_k))
+        self.assertTrue(torch.equal(captured["v_uncomp"], expected_v))
 
 
 class TestFusedKernel(unittest.TestCase):

@@ -1916,8 +1916,56 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # v2 eagle has over-allocation
         return num_tokens * (1 + self.is_spec_v2)
 
+    def visual_scratch_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ) -> int:
+        """Return the temporary scratch KV budget needed for released visual caches."""
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            return 0
+
+        if not server_args.enable_svd_kv_cache:
+            return 0
+
+        allocator = self.token_to_kv_pool_allocator
+        get_kvcache = getattr(allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return 0
+
+        kv_pool = get_kvcache()
+        get_visual_cache = getattr(kv_pool, "get_visual_cache", None)
+        if get_visual_cache is None:
+            return 0
+
+        page_size = max(getattr(allocator, "page_size", 1), 1)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+
+        total_tokens = 0
+        for req in requests:
+            if req.req_pool_idx is None:
+                continue
+
+            vis_cache = get_visual_cache(req.req_pool_idx)
+            if vis_cache is None or not vis_cache.is_compressed:
+                continue
+            if not vis_cache.released_dense_visual_slots:
+                continue
+
+            total_tokens += ceil_align(vis_cache.num_tokens, page_size)
+
+        return total_tokens
+
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        decode_tokens = self.new_tokens_required_next_decode(selected_indices)
+        scratch_tokens = self.visual_scratch_tokens_required_next_decode(
+            selected_indices
+        )
+        num_tokens = decode_tokens + scratch_tokens
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
