@@ -40,11 +40,6 @@ from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -75,6 +70,21 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+
+
+def _get_index_buf_accessor():
+    from sglang.srt.layers.attention.nsa import index_buf_accessor
+
+    return index_buf_accessor
+
+
+def _get_quantize_k_cache_fns():
+    from sglang.srt.layers.attention.nsa.quant_k_cache import (
+        quantize_k_cache,
+        quantize_k_cache_separate,
+    )
+
+    return quantize_k_cache, quantize_k_cache_separate
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1529,9 +1539,15 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             else scratch_allocation[:need_slots]
         )
         if scratch_slots is None:
-            raise RuntimeError(
-                f"Failed to allocate visual scratch slots for req_pool_idx={req_pool_idx}"
+            logger.warning(
+                "Failed to allocate visual scratch slots for req_pool_idx=%s: "
+                "need_slots=%s alloc_size=%s available_size=%s",
+                req_pool_idx,
+                need_slots,
+                alloc_size,
+                token_to_kv_pool_allocator.available_size(),
             )
+            return None
 
         visual_positions = vis_cache.visual_token_positions.to(
             device=req_to_token_row.device, dtype=torch.int64
@@ -2229,6 +2245,7 @@ class MLATokenToKVPool(KVCache):
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
+            _, quantize_k_cache_separate = _get_quantize_k_cache_fns()
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
                 cache_k_nope, cache_k_rope
             )
@@ -2403,6 +2420,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+            quantize_k_cache, _ = _get_quantize_k_cache_fns()
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
@@ -2528,7 +2546,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetK.execute(
+        return _get_index_buf_accessor().GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
@@ -2539,7 +2557,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetS.execute(
+        return _get_index_buf_accessor().GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
@@ -2563,7 +2581,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  k_scale: (seq_len, 4), uint8
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetKAndS.execute(
+        return _get_index_buf_accessor().GetKAndS.execute(
             self,
             buf,
             page_indices=page_indices,
@@ -2580,7 +2598,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
+        _get_index_buf_accessor().SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 

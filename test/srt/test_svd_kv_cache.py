@@ -419,6 +419,46 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
         self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
         self.assertIsNone(vis_cache.visual_slot_indices)
 
+    def test_activate_visual_scratch_returns_none_when_allocator_oom(self):
+        """Scratch activation should fail cleanly without mutating request state."""
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+        pool = self._make_pool()
+        allocator = TokenToKVPoolAllocator(
+            size=1,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        req_pool_idx = 0
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 0, 21, 0], dtype=torch.int32)
+        final_slots = torch.tensor([5, 9], dtype=torch.int64)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        vis_cache.visual_token_positions = visual_positions.clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.released_dense_visual_slots = True
+
+        scratch = pool.activate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertIsNone(scratch)
+        self.assertTrue(
+            torch.equal(
+                req_to_token_row,
+                torch.tensor([20, 0, 21, 0], dtype=torch.int32),
+            )
+        )
+        self.assertIsNone(vis_cache.visual_slot_indices)
+        self.assertIsNone(vis_cache.scratch_slot_allocation)
+
     def test_activate_visual_scratch_page_aligns_allocation(self):
         """Scratch allocation should reserve whole pages while exposing only used slots."""
         from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
@@ -665,7 +705,7 @@ class TestSVDDecodeScratchBudget(unittest.TestCase):
         batch.token_to_kv_pool_allocator = allocator
         batch.tree_cache = SimpleNamespace()
         batch.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-        batch.is_spec_v2 = False
+        batch.enable_overlap = False
         return batch
 
     def test_visual_scratch_tokens_required_next_decode(self):
@@ -759,10 +799,27 @@ class TestSVDDecodeScratchBudget(unittest.TestCase):
         self.assertEqual(len(retracted_reqs), 1)
         self.assertEqual(len(reqs_to_abort), 0)
         self.assertEqual(len(batch.reqs), 1)
-        self.assertEqual(batch.reqs[0].req_pool_idx, 1)
+        self.assertEqual(batch.reqs[0].req_pool_idx, 0)
 
 
 class TestSVDDecodeScratchLifecycle(unittest.TestCase):
+    def _make_pool(self, size=64, device="cpu"):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+
+        return MHATokenToKVPoolSVD(
+            size=size,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=4,
+            head_dim=8,
+            layer_num=2,
+            device=device,
+            enable_memory_saver=False,
+            rank_k=4,
+            rank_v=4,
+            compress_period=32,
+        )
+
     def _make_idle_forward_batch(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -813,6 +870,146 @@ class TestSVDDecodeScratchLifecycle(unittest.TestCase):
 
         forward_batch = self._make_idle_forward_batch()
         backend.finish_forward_metadata(forward_batch)
+
+    def test_decode_scratch_preflight_rejects_underbudget_batch(self):
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+        pool = self._make_pool()
+        allocator = TokenToKVPoolAllocator(
+            size=2,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        for req_pool_idx, final_slots in (
+            (0, torch.tensor([5, 9], dtype=torch.int64)),
+            (1, torch.tensor([10, 11], dtype=torch.int64)),
+        ):
+            pool.compress_all_layers(
+                req_pool_idx=req_pool_idx, visual_slot_indices=final_slots
+            )
+            vis_cache = pool.get_visual_cache(req_pool_idx)
+            vis_cache.visual_token_positions = torch.tensor([1, 3], dtype=torch.int64)
+            vis_cache.visual_slot_indices = None
+            vis_cache.released_dense_visual_slots = True
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        backend.svd_enabled = True
+        backend.indices_updater_decode = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator
+        )
+
+        req_to_token = torch.tensor(
+            [[20, 0, 21, 0], [30, 0, 31, 0]], dtype=torch.int32
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Insufficient KV scratch capacity before decode"
+        ):
+            backend._maybe_activate_svd_scratch(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                batch_size=2,
+                kv_pool=pool,
+                req_to_token=req_to_token,
+            )
+
+        self.assertTrue(
+            torch.equal(
+                req_to_token,
+                torch.tensor([[20, 0, 21, 0], [30, 0, 31, 0]], dtype=torch.int32),
+            )
+        )
+
+    def test_decode_scratch_activation_rolls_back_partial_batch(self):
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+
+        allocator = SimpleNamespace(page_size=1, available_size=lambda: 8)
+        caches = {
+            0: SimpleNamespace(
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                visual_slot_indices=None,
+                visual_token_positions=torch.tensor([1, 3], dtype=torch.int64),
+                num_tokens=2,
+            ),
+            1: SimpleNamespace(
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                visual_slot_indices=None,
+                visual_token_positions=torch.tensor([0, 2], dtype=torch.int64),
+                num_tokens=2,
+            ),
+        }
+        kv_pool = MHATokenToKVPoolSVD.__new__(MHATokenToKVPoolSVD)
+        kv_pool.get_visual_cache = lambda req_pool_idx: caches[req_pool_idx]
+        kv_pool.activate_visual_scratch = Mock(
+            side_effect=[
+                torch.tensor([101, 102], dtype=torch.int64),
+                None,
+            ]
+        )
+        kv_pool.deactivate_visual_scratch = Mock()
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        backend.svd_enabled = True
+        backend.indices_updater_decode = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator
+        )
+
+        req_to_token = torch.tensor(
+            [[20, 0, 21, 0], [30, 0, 31, 0]], dtype=torch.int32
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Visual scratch activation failed after preflight"
+        ):
+            backend._maybe_activate_svd_scratch(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                batch_size=2,
+                kv_pool=kv_pool,
+                req_to_token=req_to_token,
+            )
+
+        kv_pool.deactivate_visual_scratch.assert_called_once()
+        _, deactivate_kwargs = kv_pool.deactivate_visual_scratch.call_args
+        self.assertEqual(deactivate_kwargs["req_pool_idx"], 0)
+        self.assertTrue(
+            torch.equal(
+                deactivate_kwargs["req_to_token_row"],
+                req_to_token[0],
+            )
+        )
+
+    def test_recompression_skips_released_dense_visual_slots(self):
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+
+        backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+        vis_cache = SimpleNamespace(
+            is_compressed=True,
+            released_dense_visual_slots=True,
+            steps_since_compress=31,
+            visual_slot_indices=torch.tensor([7, 8], dtype=torch.int64),
+        )
+        kv_pool = SimpleNamespace(
+            start_layer=0,
+            layer_num=2,
+            compress_period=32,
+            get_visual_cache=lambda req_pool_idx: vis_cache,
+            compress_visual_tokens=Mock(),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        )
+
+        backend._svd_check_recompression(forward_batch, kv_pool)
+
+        self.assertEqual(vis_cache.steps_since_compress, 31)
+        kv_pool.compress_visual_tokens.assert_not_called()
 
 
 class TestSVDFusedDecodeVisualIdentity(unittest.TestCase):

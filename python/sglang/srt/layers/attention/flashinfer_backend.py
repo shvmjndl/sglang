@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -543,14 +544,68 @@ class FlashInferAttnBackend(AttentionBackend):
         if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
             return has_svd_scratch
 
+        allocator = self.indices_updater_decode.token_to_kv_pool_allocator
+        page_size = max(getattr(allocator, "page_size", 1), 1)
+        required_scratch_tokens = 0
+        for i in range(batch_size):
+            req_pool_idx = req_pool_indices[i].item()
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            if vis_cache is None or not vis_cache.is_compressed:
+                continue
+            if not vis_cache.released_dense_visual_slots:
+                continue
+            if vis_cache.visual_slot_indices is not None:
+                continue
+            if (
+                vis_cache.visual_token_positions is None
+                or len(vis_cache.visual_token_positions) == 0
+            ):
+                continue
+            required_scratch_tokens += ceil_align(vis_cache.num_tokens, page_size)
+
+        available_scratch_tokens = allocator.available_size()
+        if required_scratch_tokens > available_scratch_tokens:
+            raise RuntimeError(
+                "Insufficient KV scratch capacity before decode: "
+                f"required={required_scratch_tokens}, "
+                f"available={available_scratch_tokens}. "
+                "check_decode_mem() should have reserved this headroom."
+            )
+
+        activated_req_rows = []
         for i in range(batch_size):
             req_pool_idx = req_pool_indices[i].item()
             req_to_token_row = req_to_token[req_pool_idx]
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            needed_new_scratch = (
+                vis_cache is not None
+                and vis_cache.is_compressed
+                and vis_cache.released_dense_visual_slots
+                and vis_cache.visual_slot_indices is None
+                and vis_cache.visual_token_positions is not None
+                and len(vis_cache.visual_token_positions) > 0
+            )
             scratch_slots = kv_pool.activate_visual_scratch(
                 req_pool_idx=req_pool_idx,
                 req_to_token_row=req_to_token_row,
-                token_to_kv_pool_allocator=self.indices_updater_decode.token_to_kv_pool_allocator,
+                token_to_kv_pool_allocator=allocator,
             )
+            if needed_new_scratch and scratch_slots is None:
+                for activated_req_pool_idx, activated_req_to_token_row in reversed(
+                    activated_req_rows
+                ):
+                    kv_pool.deactivate_visual_scratch(
+                        req_pool_idx=activated_req_pool_idx,
+                        req_to_token_row=activated_req_to_token_row,
+                        token_to_kv_pool_allocator=allocator,
+                    )
+                raise RuntimeError(
+                    "Visual scratch activation failed after preflight for "
+                    f"req_pool_idx={req_pool_idx}. This indicates unexpected KV "
+                    "allocator state drift during decode setup."
+                )
+            if needed_new_scratch and scratch_slots is not None:
+                activated_req_rows.append((req_pool_idx, req_to_token_row))
             has_svd_scratch = has_svd_scratch or scratch_slots is not None
 
         return has_svd_scratch
@@ -1282,6 +1337,12 @@ class FlashInferAttnBackend(AttentionBackend):
             req_pool_idx = forward_batch.req_pool_indices[i].item()
             vis_cache = kv_pool.get_visual_cache(req_pool_idx)
             if vis_cache is None or not vis_cache.is_compressed:
+                continue
+            if vis_cache.released_dense_visual_slots:
+                # Once dense visual slots have been released, the compressed
+                # factors become the long-lived source of truth. Decode may
+                # materialize approximate scratch KV for one step, but we should
+                # not feed that transient data back into periodic recompression.
                 continue
 
             vis_cache.steps_since_compress += 1
