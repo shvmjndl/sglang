@@ -993,28 +993,34 @@ class FlashInferAttnBackend(AttentionBackend):
                 q, layer, forward_batch, kv_pool
             )
 
+        lse = None  # populated below for the non-fused path
+
         if not use_fused or o is None:
             # Decompress visual KV back into the slot pool for all requests
             for i in range(forward_batch.batch_size):
                 req_pool_idx = forward_batch.req_pool_indices[i].item()
                 kv_pool.write_decompressed_to_slots(layer_id, req_pool_idx)
 
-            # Standard FlashInfer paged attention over the now-populated slots
-            o = decode_wrapper.forward(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                kv_pool.get_kv_buffer(layer_id),
+            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            kv_buf = kv_pool.get_kv_buffer(layer_id)
+            fw_kwargs = dict(
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
 
+            # Prefer forward_return_lse so we get the softmax denominator for
+            # free and can normalize visual importance without a separate key
+            # gather across the full sequence.
+            if hasattr(decode_wrapper, "forward_return_lse"):
+                o, lse = decode_wrapper.forward_return_lse(q_view, kv_buf, **fw_kwargs)
+                # lse: [B, H_q] — log-sum-exp over all KV positions per head
+            else:
+                o = decode_wrapper.forward(q_view, kv_buf, **fw_kwargs)
+
         # --- Update importance scores (Paper Eq. 1) ---
-        # Compute approximate attention weights for compressed tokens
-        # This is cheap for decode (T_q = 1)
-        self._svd_update_importance(
-            q, layer, forward_batch, kv_pool
-        )
+        self._svd_update_importance(q, layer, forward_batch, kv_pool, lse=lse)
 
         # --- Periodic re-compression (Paper Algorithm 1, lines 14-17) ---
         # Only check on the last layer to avoid redundant per-layer checks
@@ -1096,19 +1102,50 @@ class FlashInferAttnBackend(AttentionBackend):
         layer,
         forward_batch: ForwardBatch,
         kv_pool: MHATokenToKVPoolSVD,
+        lse: Optional[torch.Tensor] = None,
     ):
-        """Update importance scores for compressed tokens after attention.
+        """Update importance scores using the LSE returned by FlashInfer.
 
         Paper Eq. 1: I_tp ← α^Tq * I_tp + (1 - α^Tq) * avg_attn
 
-        Since FlashInfer doesn't return raw attention weights, we compute
-        approximate scores using q @ k_decompressed^T. This is cheap for
-        decode (T_q = 1, single matmul per request).
+        Strategy (non-fused path):
+          FlashInfer's forward_return_lse gives lse[b, h] = log Σ_t exp(q·k_t/√d),
+          the log of the softmax denominator.  For visual token t we only need:
+            attn_weight_t = exp(q·k_visual_t/√d − lse)
+          Visual keys are reconstructed directly from the compressed factors
+          (K̄ @ D_k), so we never read the full key buffer.  Cost is O(T_c·R·D)
+          vs O(T_total·H·D) for the previous k_all gather.
+
+          For GQA: each query head q maps to KV head h = q // G.  We compute
+          one score per query head, normalize against that head's lse, then
+          average across all query heads for the final importance.
+
+        Strategy (fused path / lse unavailable):
+          The fused Triton kernel updates importance internally; skip here.
+          If lse is None for the non-fused path (old FlashInfer without
+          forward_return_lse), skip entirely rather than falling back to the
+          expensive k_all gather.
         """
+        if lse is None:
+            # Fused kernel updates importance in-kernel; non-fused without LSE
+            # support skips the update rather than doing the expensive gather.
+            return
+
         layer_id = layer.layer_id
-        q_shaped = q.contiguous().view(
-            forward_batch.batch_size, layer.tp_q_head_num, layer.head_dim
-        )
+        H_q = layer.tp_q_head_num
+        H_kv = layer.tp_k_head_num
+        D = layer.head_dim
+        G = H_q // H_kv  # heads per KV group (1 for MHA)
+
+        # q_shaped: [B, H_q, D]
+        q_shaped = q.contiguous().view(forward_batch.batch_size, H_q, D)
+
+        # lse may be [B, H_q] or [B, H_q, 1] depending on FlashInfer version
+        lse_2d = lse.view(forward_batch.batch_size, H_q)  # [B, H_q]
+
+        # Precompute the KV-head index for each query head once (outside request loop)
+        # kv_head_of_q[h_q] = h_q // G
+        kv_head_of_q = torch.arange(H_q, device=q.device) // G  # [H_q]
 
         for i in range(forward_batch.batch_size):
             req_pool_idx = forward_batch.req_pool_indices[i].item()
@@ -1117,49 +1154,39 @@ class FlashInferAttnBackend(AttentionBackend):
                 continue
 
             l = layer_id - kv_pool.start_layer
-            if vis_cache.k_compressed[l] is None:
+            k_bar = vis_cache.k_compressed[l]  # [T_c, R_k]
+            d_k = vis_cache.k_decomp[l]        # [R_k, H_kv * D]
+            if k_bar is None or d_k is None:
                 continue
 
-            # Read visual token keys from slots (already decompressed in non-fused path,
-            # avoids redundant decompress_kv call)
-            visual_slots = vis_cache.visual_slot_indices
-            if visual_slots is None or len(visual_slots) == 0:
-                continue
+            T_c = k_bar.shape[0]
 
-            k_visual = kv_pool._get_key_buffer(layer_id)[visual_slots]  # [T_c, H_kv, D]
-            T_c = k_visual.shape[0]
-            H_kv = k_visual.shape[1]
+            # Reconstruct visual keys from compressed factors — O(T_c · R_k · H_kv · D)
+            # k_visual_flat: [T_c, H_kv * D]
+            k_visual_flat = (k_bar.float() @ d_k.float())
+            # k_visual: [T_c, H_kv, D]
+            k_visual = k_visual_flat.view(T_c, H_kv, D)
 
             # q_i: [H_q, D]
-            q_i = q_shaped[i]
+            q_i = q_shaped[i].float()
 
-            # Map query heads to KV heads (GQA support)
-            heads_per_group = layer.tp_q_head_num // H_kv
-            q_kv = q_i[::heads_per_group] if heads_per_group > 1 else q_i  # [H_kv, D]
+            # Map each query head to its KV head's keys: [T_c, H_q, D]
+            k_per_q = k_visual[:, kv_head_of_q, :]  # advanced index, no data copy
 
-            # Compute attention scores over ALL tokens (visual + uncompressed)
-            # to get properly normalized importance weights (BUG 13 fix)
-            seq_len = forward_batch.seq_lens[i].item()
-            req_row = forward_batch.req_pool_indices[i].item()
-            all_slots = forward_batch.req_to_token_pool.req_to_token[req_row][:seq_len]
-            k_all = kv_pool._get_key_buffer(layer_id)[all_slots]  # [T_total, H_kv, D]
+            # scores[h_q, t] = q_i[h_q] · k_per_q[t, h_q] * scale  →  [H_q, T_c]
+            scores = torch.einsum("qd,tqd->qt", q_i, k_per_q) * layer.scaling
+            # Transpose to [H_q, T_c] to align with lse_2d[i]: [H_q]
+            scores = scores.T  # [H_q, T_c]
 
-            # Full attention scores: [H_kv, T_total]
-            scores = torch.einsum("hd,thd->ht", q_kv.float(), k_all.float())
-            scores = scores * layer.scaling
-            attn_weights = torch.softmax(scores, dim=-1)  # [H_kv, T_total]
+            # Normalize: exp(score - lse) gives the exact softmax weight for
+            # each visual token, with the denominator from FlashInfer's full pass.
+            # lse_2d[i]: [H_q] → unsqueeze to [H_q, 1] for broadcast
+            attn_weights = torch.exp(scores - lse_2d[i].unsqueeze(1))  # [H_q, T_c]
 
-            # Extract attention weights for visual token positions only
-            # visual_slots are pool slot indices; find their positions in all_slots
-            visual_positions = torch.isin(all_slots, visual_slots).nonzero(as_tuple=True)[0]
-            visual_attn = attn_weights[:, visual_positions]  # [H_kv, T_c]
+            # Average across all query heads → [T_c]
+            avg_importance = attn_weights.mean(dim=0).to(kv_pool.dtype)
 
-            # Average across heads → [T_c]
-            avg_importance = visual_attn.mean(dim=0)
-
-            kv_pool.update_importance_scores(
-                layer_id, req_pool_idx, avg_importance
-            )
+            kv_pool.update_importance_scores(layer_id, req_pool_idx, avg_importance)
 
     def _svd_check_recompression(
         self,
