@@ -2230,33 +2230,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(
-                global_dp_buffer_len,
-                num_tokens,
-                forward_batch.dp_padding_mode.is_max_len(),
-            )
-            set_is_extend_in_batch(False)
-
-            kwargs = {}
-            if (
-                self.server_args.pp_size > 1
-                and "pp_proxy_tensors"
-                in inspect.signature(self.model.forward).parameters
-            ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+            try:
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
                 )
-            if not self.is_generation:
-                kwargs["get_embedding"] = True
+                set_is_extend_in_batch(False)
 
-            logits_output_or_pp_proxy_tensors = self.model.forward(
-                buffers.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
-            return logits_output_or_pp_proxy_tensors
+                kwargs = {}
+                if (
+                    self.server_args.pp_size > 1
+                    and "pp_proxy_tensors"
+                    in inspect.signature(self.model.forward).parameters
+                ):
+                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                    )
+                if not self.is_generation:
+                    kwargs["get_embedding"] = True
+
+                logits_output_or_pp_proxy_tensors = self.model.forward(
+                    buffers.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+                return logits_output_or_pp_proxy_tensors
+            finally:
+                self.attn_backend.finish_forward_metadata(forward_batch)
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
@@ -2506,6 +2509,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        attn_backend = self.decode_attn_backend if self.server_args.enable_pdmux else self.attn_backend
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
@@ -2516,12 +2520,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
-        )
+        try:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+        finally:
+            attn_backend.finish_forward_metadata(forward_batch)
 
     def forward_extend(
         self,
@@ -2575,12 +2582,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
-        )
+        try:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+        finally:
+            self.attn_backend.finish_forward_metadata(forward_batch)
 
     def forward_split_prefill(
         self,

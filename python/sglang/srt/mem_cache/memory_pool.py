@@ -1089,6 +1089,8 @@ class PerRequestVisualCache:
         "is_compressed",
         "steps_since_compress",
         "visual_slot_indices",
+        "visual_token_positions",
+        "released_dense_visual_slots",
         "_orig_dtype",
         "_quantized",
     )
@@ -1110,6 +1112,8 @@ class PerRequestVisualCache:
         self.steps_since_compress = 0
         # Final resolved visual slots after prefix-cache remap has stabilized.
         self.visual_slot_indices: Optional[torch.Tensor] = None
+        self.visual_token_positions: Optional[torch.Tensor] = None
+        self.released_dense_visual_slots = False
         self._orig_dtype = None
         self._quantized = False
 
@@ -1455,6 +1459,101 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
             self.compress_visual_tokens(layer_id, req_pool_idx, visual_slot_indices)
 
+    def release_visual_slots_after_prefill(
+        self,
+        req_pool_idx: int,
+        req_to_token_row: torch.Tensor,
+        visual_token_positions: torch.Tensor,
+        token_to_kv_pool_allocator,
+    ):
+        """Release long-lived dense visual slots after prefill compression.
+
+        The compressed cache becomes the source of truth. Dense visual slots are
+        removed from the request row and returned to the allocator. Decode can
+        temporarily materialize them later using scratch slots.
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return
+        if vis_cache.visual_slot_indices is None or len(vis_cache.visual_slot_indices) == 0:
+            return
+
+        visual_positions = visual_token_positions.to(
+            device=req_to_token_row.device, dtype=torch.int64
+        )
+        visual_positions = visual_positions[visual_positions < req_to_token_row.shape[0]]
+        if len(visual_positions) == 0:
+            return
+
+        slots_to_free = vis_cache.visual_slot_indices.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+
+        req_to_token_row[visual_positions] = 0
+        token_to_kv_pool_allocator.free(slots_to_free)
+
+        vis_cache.visual_token_positions = visual_positions.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.released_dense_visual_slots = True
+
+    def activate_visual_scratch(
+        self,
+        req_pool_idx: int,
+        req_to_token_row: torch.Tensor,
+        token_to_kv_pool_allocator,
+    ) -> Optional[torch.Tensor]:
+        """Materialize per-step visual scratch slots for decode."""
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return None
+        if not vis_cache.released_dense_visual_slots:
+            return vis_cache.visual_slot_indices
+        if vis_cache.visual_token_positions is None or len(vis_cache.visual_token_positions) == 0:
+            return None
+        if vis_cache.visual_slot_indices is not None:
+            return vis_cache.visual_slot_indices
+
+        scratch_slots = token_to_kv_pool_allocator.alloc(len(vis_cache.visual_token_positions))
+        if scratch_slots is None:
+            raise RuntimeError(
+                f"Failed to allocate visual scratch slots for req_pool_idx={req_pool_idx}"
+            )
+
+        visual_positions = vis_cache.visual_token_positions.to(
+            device=req_to_token_row.device, dtype=torch.int64
+        )
+        req_to_token_row[visual_positions] = scratch_slots.to(req_to_token_row.dtype)
+        vis_cache.visual_slot_indices = scratch_slots.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+        return vis_cache.visual_slot_indices
+
+    def deactivate_visual_scratch(
+        self,
+        req_pool_idx: int,
+        req_to_token_row: torch.Tensor,
+        token_to_kv_pool_allocator,
+    ):
+        """Release step-local visual scratch slots after decode completes."""
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or vis_cache.visual_slot_indices is None:
+            return
+        if not vis_cache.released_dense_visual_slots:
+            return
+
+        if vis_cache.visual_token_positions is not None and len(vis_cache.visual_token_positions) > 0:
+            visual_positions = vis_cache.visual_token_positions.to(
+                device=req_to_token_row.device, dtype=torch.int64
+            )
+            req_to_token_row[visual_positions] = 0
+
+        token_to_kv_pool_allocator.free(
+            vis_cache.visual_slot_indices.to(device=self.device, dtype=torch.int64)
+        )
+        vis_cache.visual_slot_indices = None
+
     def decompress_all_layers_to_slots(self, req_pool_idx: int):
         """Decompress visual KV across all layers back to slot pool.
         Called before attention computation in the non-fused path."""
@@ -1472,7 +1571,12 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             return {"compressed": False}
 
         if not vis_cache.is_compressed or vis_cache.k_compressed[0] is None:
-            return {"compressed": False, "num_visual_tokens": vis_cache.num_tokens}
+            return {
+                "compressed": False,
+                "num_visual_tokens": vis_cache.num_tokens,
+                "released_dense_visual_slots": vis_cache.released_dense_visual_slots,
+                "has_active_scratch": vis_cache.visual_slot_indices is not None,
+            }
 
         T_v = vis_cache.num_tokens
         elem_size = self.dtype.itemsize if hasattr(self.dtype, 'itemsize') else torch.tensor([], dtype=self.dtype).element_size()
@@ -1492,6 +1596,8 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             "compression_ratio": original_bytes / max(compressed_bytes, 1),
             "rank_k": self.rank_k,
             "rank_v": self.rank_v,
+            "released_dense_visual_slots": vis_cache.released_dense_visual_slots,
+            "has_active_scratch": vis_cache.visual_slot_indices is not None,
         }
 
 

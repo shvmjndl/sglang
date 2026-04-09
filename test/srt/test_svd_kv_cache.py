@@ -343,6 +343,231 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
         self.assertTrue(vis_cache.is_compressed)
         self.assertTrue(torch.equal(vis_cache.visual_slot_indices, final_slots))
 
+    def test_release_visual_slots_after_prefill(self):
+        """Dense visual slots should be released after compression finalization."""
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+        pool = self._make_pool()
+        allocator = TokenToKVPoolAllocator(
+            size=32,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        req_pool_idx = 0
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 5, 21, 9], dtype=torch.int32)
+        final_slots = torch.tensor([5, 9], dtype=torch.int64)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+        pool.release_visual_slots_after_prefill(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            visual_token_positions=visual_positions,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
+        self.assertTrue(vis_cache.released_dense_visual_slots)
+        self.assertIsNone(vis_cache.visual_slot_indices)
+        self.assertTrue(torch.equal(vis_cache.visual_token_positions, visual_positions))
+
+    def test_activate_and_deactivate_visual_scratch(self):
+        """Decode scratch slots should be temporary and restore row placeholders."""
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+        pool = self._make_pool()
+        allocator = TokenToKVPoolAllocator(
+            size=32,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        req_pool_idx = 0
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 0, 21, 0], dtype=torch.int32)
+        final_slots = torch.tensor([5, 9], dtype=torch.int64)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        vis_cache.visual_token_positions = visual_positions.clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.released_dense_visual_slots = True
+
+        scratch = pool.activate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertIsNotNone(scratch)
+        self.assertTrue(torch.equal(req_to_token_row[visual_positions], scratch.to(torch.int32)))
+
+        pool.deactivate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
+        self.assertIsNone(vis_cache.visual_slot_indices)
+
+    def test_compression_stats_report_released_and_scratch_state(self):
+        """Compression stats should surface released/scratch state for debugging."""
+        pool = self._make_pool()
+
+        req_pool_idx = 0
+        final_slots = torch.tensor([5, 9], dtype=torch.int64)
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        vis_cache.released_dense_visual_slots = True
+        vis_cache.visual_slot_indices = None
+        stats = pool.get_compression_stats(req_pool_idx)
+        self.assertTrue(stats["released_dense_visual_slots"])
+        self.assertFalse(stats["has_active_scratch"])
+
+        vis_cache.visual_slot_indices = torch.tensor([11, 12], dtype=torch.int64)
+        stats = pool.get_compression_stats(req_pool_idx)
+        self.assertTrue(stats["has_active_scratch"])
+
+
+class TestSVDRadixOwnership(unittest.TestCase):
+    """Test that multimodal SVD requests only cache the pure-text prefix."""
+
+    class _DummyReq:
+        def __init__(self):
+            self._kv_committed_len = 0
+
+        def pop_committed_kv_cache(self):
+            return self._kv_committed_len
+
+    def _make_tree(self, page_size=1):
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        req_to_token_pool = ReqToTokenPool(
+            size=4,
+            max_context_len=32,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=128,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        tree = RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+            )
+        )
+        return tree, allocator, req_to_token_pool
+
+    def _enable_svd_args(self, page_size=1):
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        args = ServerArgs(model_path="dummy")
+        args.enable_svd_kv_cache = True
+        args.page_size = page_size
+        set_global_server_args_for_scheduler(args)
+
+    def test_cache_unfinished_req_only_inserts_text_prefix(self):
+        self._enable_svd_args(page_size=1)
+        tree, allocator, req_to_token_pool = self._make_tree(page_size=1)
+
+        req = self._DummyReq()
+        req.req_pool_idx = 0
+        req.fill_ids = [10, 11, 12, 13, 14]
+        req.origin_input_ids = req.fill_ids[:]
+        req.output_ids = []
+        req.extra_key = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.visual_token_positions = torch.tensor([2, 3], dtype=torch.int64)
+        req.svd_first_visual_pos = None
+        req.multimodal_inputs = object()
+
+        kv_indices = allocator.alloc(len(req.fill_ids))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(req.fill_ids))), kv_indices)
+
+        tree.cache_unfinished_req(req)
+
+        self.assertEqual(req.cache_protected_len, 2)
+        self.assertEqual(tree.total_size(), 2)
+        self.assertTrue(torch.equal(req.prefix_indices[:2], kv_indices[:2]))
+        self.assertTrue(torch.equal(req.prefix_indices[2:], kv_indices[2:]))
+
+    def test_cache_finished_req_frees_visual_suffix_instead_of_caching_it(self):
+        self._enable_svd_args(page_size=1)
+        tree, allocator, req_to_token_pool = self._make_tree(page_size=1)
+
+        req = self._DummyReq()
+        req.req_pool_idx = 0
+        req.origin_input_ids = [10, 11, 12, 13, 14]
+        req.output_ids = []
+        req._kv_committed_len = len(req.origin_input_ids)
+        req.extra_key = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.visual_token_positions = torch.tensor([2, 3], dtype=torch.int64)
+        req.svd_first_visual_pos = None
+        req.multimodal_inputs = object()
+
+        kv_indices = allocator.alloc(req._kv_committed_len)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, req._kv_committed_len)),
+            kv_indices,
+        )
+
+        tree.cache_finished_req(req, is_insert=True)
+
+        self.assertEqual(tree.total_size(), 2)
+        self.assertEqual(allocator.available_size(), 126)
+
+    def test_page_aligned_prefix_stops_before_visual_page(self):
+        self._enable_svd_args(page_size=4)
+        tree, allocator, req_to_token_pool = self._make_tree(page_size=4)
+
+        req = self._DummyReq()
+        req.req_pool_idx = 0
+        req.fill_ids = [10, 11, 12, 13, 14, 15]
+        req.origin_input_ids = req.fill_ids[:]
+        req.output_ids = []
+        req.extra_key = None
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.visual_token_positions = torch.tensor([3], dtype=torch.int64)
+        req.svd_first_visual_pos = None
+        req.multimodal_inputs = object()
+
+        kv_indices = allocator.alloc(len(req.fill_ids))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(req.fill_ids))), kv_indices)
+
+        tree.cache_unfinished_req(req)
+
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(tree.total_size(), 0)
+        self.assertTrue(torch.equal(req.prefix_indices, kv_indices))
+
 
 class TestFusedKernel(unittest.TestCase):
     """Test fused Triton kernel correctness against reference implementation."""

@@ -807,11 +807,16 @@ class CPUGraphRunner:
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
 
         prepared_forward_batch = self.prepare_replay(forward_batch)
-        output = self.graphs[prepared_forward_batch.batch_size](
-            prepared_forward_batch.input_ids,
-            prepared_forward_batch.positions,
-            prepared_forward_batch,
-        )
+        try:
+            output = self.graphs[prepared_forward_batch.batch_size](
+                prepared_forward_batch.input_ids,
+                prepared_forward_batch.positions,
+                prepared_forward_batch,
+            )
+        finally:
+            self.model_runner.attn_backend.finish_forward_metadata(
+                prepared_forward_batch
+            )
         if forward_batch.batch_size in self.graphs:
             return output
 

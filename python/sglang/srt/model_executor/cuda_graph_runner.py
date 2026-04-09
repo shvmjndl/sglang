@@ -982,31 +982,34 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(
-                global_dp_buffer_len,
-                num_tokens,
-                forward_batch.dp_padding_mode.is_max_len(),
-            )
-            set_is_extend_in_batch(False)
-
-            kwargs = {}
-            if (
-                self.pp_size > 1
-                and "pp_proxy_tensors" in inspect.signature(forward).parameters
-            ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+            try:
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
                 )
+                set_is_extend_in_batch(False)
 
-            logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
-            return logits_output_or_pp_proxy_tensors
+                kwargs = {}
+                if (
+                    self.pp_size > 1
+                    and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                ):
+                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                    )
+
+                logits_output_or_pp_proxy_tensors = forward(
+                    input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+                return logits_output_or_pp_proxy_tensors
+            finally:
+                attn_backend.finish_forward_metadata(forward_batch)
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
@@ -1111,6 +1114,8 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        if self.capture_forward_mode.is_decode_or_idle():
+            attn_backend.init_forward_metadata(forward_batch)
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1150,8 +1155,14 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
-        output = self.output_buffers[graph_key]
+        try:
+            self.graphs[graph_key].replay()
+            output = self.output_buffers[graph_key]
+        finally:
+            if self.enable_pdmux:
+                self.model_runner.decode_attn_backend.finish_forward_metadata(forward_batch)
+            else:
+                self.model_runner.attn_backend.finish_forward_metadata(forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

@@ -94,6 +94,7 @@ class MultiItemScoringParams:
 @dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    has_svd_scratch: bool = False
 
 
 @dataclass
@@ -434,6 +435,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
+            has_svd_scratch = self._maybe_activate_svd_scratch(
+                req_pool_indices=forward_batch.req_pool_indices,
+                batch_size=forward_batch.batch_size,
+                kv_pool=forward_batch.token_to_kv_pool,
+                req_to_token=forward_batch.req_to_token_pool.req_to_token,
+            )
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -445,7 +452,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                self.decode_wrappers, has_svd_scratch=has_svd_scratch
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -521,6 +530,46 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params,
             )
 
+    def _maybe_activate_svd_scratch(
+        self,
+        req_pool_indices: torch.Tensor,
+        batch_size: int,
+        kv_pool,
+        req_to_token,
+    ) -> bool:
+        has_svd_scratch = False
+        if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
+            return has_svd_scratch
+
+        for i in range(batch_size):
+            req_pool_idx = req_pool_indices[i].item()
+            req_to_token_row = req_to_token[req_pool_idx]
+            scratch_slots = kv_pool.activate_visual_scratch(
+                req_pool_idx=req_pool_idx,
+                req_to_token_row=req_to_token_row,
+                token_to_kv_pool_allocator=self.indices_updater_decode.token_to_kv_pool_allocator,
+            )
+            has_svd_scratch = has_svd_scratch or scratch_slots is not None
+
+        return has_svd_scratch
+
+    def finish_forward_metadata(self, forward_batch: ForwardBatch):
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+
+        kv_pool = forward_batch.token_to_kv_pool
+        if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
+            return
+
+        for i in range(forward_batch.batch_size):
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            req_to_token_row = forward_batch.req_to_token_pool.req_to_token[req_pool_idx]
+            kv_pool.deactivate_visual_scratch(
+                req_pool_idx=req_pool_idx,
+                req_to_token_row=req_to_token_row,
+                token_to_kv_pool_allocator=self.indices_updater_decode.token_to_kv_pool_allocator,
+            )
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -566,6 +615,12 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
+            has_svd_scratch = self._maybe_activate_svd_scratch(
+                req_pool_indices=req_pool_indices,
+                batch_size=bs,
+                kv_pool=self.indices_updater_decode.token_to_kv_pool_allocator.get_kvcache(),
+                req_to_token=self.indices_updater_decode.req_to_token,
+            )
             decode_wrappers = []
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
@@ -595,7 +650,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                decode_wrappers, has_svd_scratch=has_svd_scratch
+            )
             for i in range(self.num_wrappers):
                 decode_wrappers[i].begin_forward = partial(
                     fast_decode_plan, decode_wrappers[i]
@@ -715,6 +772,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+            )
+            self.forward_metadata = DecodeMetadata(
+                self.decode_cuda_graph_metadata[bs],
+                has_svd_scratch=getattr(self.forward_metadata, "has_svd_scratch", False),
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -986,6 +1047,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.svd_fused_kernel
             and forward_batch.batch_size == 1
             and layer.logit_cap in (0, None)
+            and not getattr(self.forward_metadata, "has_svd_scratch", False)
         )
 
         if use_fused:
@@ -1908,6 +1970,10 @@ class FlashInferMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def finish_forward_metadata(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backends:
+            attn_backend.finish_forward_metadata(forward_batch)
 
 
 def should_use_tensor_core(

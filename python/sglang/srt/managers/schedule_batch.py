@@ -635,6 +635,7 @@ class Req(ReqDllmMixin):
         # AttentionPack: canonical visual token identity for this request.
         # These positions stay stable even if prefix-cache remaps slot indices.
         self.visual_token_positions: Optional[torch.Tensor] = None
+        self.svd_first_visual_pos: Optional[int] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -873,6 +874,7 @@ class Req(ReqDllmMixin):
         """
         if self.multimodal_inputs is None:
             self.visual_token_positions = None
+            self.svd_first_visual_pos = None
             return
 
         mm = self.multimodal_inputs
@@ -900,8 +902,10 @@ class Req(ReqDllmMixin):
             self.visual_token_positions = torch.tensor(
                 visual_positions, dtype=torch.int64
             )
+            self.svd_first_visual_pos = visual_positions[0]
         else:
             self.visual_token_positions = None
+            self.svd_first_visual_pos = None
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -2558,7 +2562,7 @@ class ModelWorkerBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # AttentionPack: per-request visual token slot indices for SVD compression
+    # Deprecated: decode scratch now resolves visual slots from visual_caches directly.
     svd_visual_slot_indices: Optional[List[Optional[torch.Tensor]]] = None
 
     # For mamba state tracking

@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -116,6 +117,64 @@ def page_align_keys(key: list, page_size) -> list:
         return key
     page_aligned_len = len(key) // page_size * page_size
     return key[:page_aligned_len]
+
+
+def _get_svd_cacheable_prefix_len(
+    req: "Req",
+    key_len: int,
+    page_size: int,
+    is_eagle: bool,
+) -> int:
+    """Limit radix ownership to the pure-text prefix before the first visual token.
+
+    When SVD KV cache is enabled, multimodal requests should keep the visual span
+    and everything after it request-private so the radix tree does not become the
+    long-lived owner of that dense KV. The request can still keep those slots for
+    decode; this helper only controls how much of the prefix tree is allowed to own.
+    """
+    if key_len == 0:
+        return 0
+
+    try:
+        global_server_args = get_global_server_args()
+    except ValueError:
+        return key_len
+
+    if not global_server_args.enable_svd_kv_cache:
+        return key_len
+
+    visual_positions = getattr(req, "visual_token_positions", None)
+    if visual_positions is None and hasattr(req, "compute_visual_token_positions"):
+        req.compute_visual_token_positions()
+        visual_positions = getattr(req, "visual_token_positions", None)
+
+    if visual_positions is None or len(visual_positions) == 0:
+        return key_len
+
+    first_visual_pos = int(visual_positions[0].item())
+    if hasattr(req, "svd_first_visual_pos"):
+        req.svd_first_visual_pos = first_visual_pos
+
+    # EAGLE bigram keys are shifted by one token.
+    if is_eagle:
+        first_visual_pos = max(first_visual_pos - 1, 0)
+
+    if key_len <= first_visual_pos:
+        return key_len
+
+    if page_size > 1:
+        first_visual_pos = first_visual_pos // page_size * page_size
+
+    return min(key_len, max(first_visual_pos, 0))
+
+
+def _free_nonzero_kv_indices(token_to_kv_pool_allocator, kv_indices: torch.Tensor):
+    if kv_indices.numel() == 0:
+        return
+    valid_indices = kv_indices[kv_indices > 0]
+    if valid_indices.numel() == 0:
+        return
+    token_to_kv_pool_allocator.free(valid_indices)
 
 
 class TreeNode:
@@ -475,7 +534,7 @@ class RadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            _free_nonzero_kv_indices(self.token_to_kv_pool_allocator, kv_indices)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -486,6 +545,14 @@ class RadixCache(BasePrefixCache):
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
+        keys = keys[
+            : _get_svd_cacheable_prefix_len(
+                req=req,
+                key_len=len(keys),
+                page_size=self.page_size,
+                is_eagle=self.is_eagle,
+            )
+        ]
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
@@ -497,16 +564,20 @@ class RadixCache(BasePrefixCache):
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+            _free_nonzero_kv_indices(
+                self.token_to_kv_pool_allocator,
+                kv_indices[req.cache_protected_len : new_prefix_len],
             )
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(keys)]
+            _free_nonzero_kv_indices(
+                self.token_to_kv_pool_allocator,
+                kv_indices[req.cache_protected_len : len(keys)],
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+        _free_nonzero_kv_indices(
+            self.token_to_kv_pool_allocator, kv_indices[len(keys) :]
+        )
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -524,6 +595,14 @@ class RadixCache(BasePrefixCache):
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
+        keys = keys[
+            : _get_svd_cacheable_prefix_len(
+                req=req,
+                key_len=len(keys),
+                page_size=self.page_size,
+                is_eagle=self.is_eagle,
+            )
+        ]
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
@@ -538,8 +617,9 @@ class RadixCache(BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+        _free_nonzero_kv_indices(
+            self.token_to_kv_pool_allocator,
+            kv_indices[req.cache_protected_len : new_prefix_len],
         )
 
         # The prefix indices could be updated, reuse it

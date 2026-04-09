@@ -1257,3 +1257,9 @@ class SchedulerOutputProcessorMixin:
         # for decode. A future optimization could use async compression with a
         # "compression pending" flag to avoid blocking the scheduler hot path.
         kv_pool.compress_all_layers(req.req_pool_idx, visual_slots)
+        kv_pool.release_visual_slots_after_prefill(
+            req_pool_idx=req.req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            visual_token_positions=visual_positions,
+            token_to_kv_pool_allocator=allocator,
+        )
