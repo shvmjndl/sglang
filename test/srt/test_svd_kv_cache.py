@@ -655,8 +655,6 @@ class TestSVDRadixOwnership(unittest.TestCase):
         self.assertEqual(req.cache_protected_len, 0)
         self.assertEqual(tree.total_size(), 0)
         self.assertTrue(torch.equal(req.prefix_indices, kv_indices))
-
-
 class TestSVDDecodeScratchBudget(unittest.TestCase):
     class _FakeKVPool:
         def __init__(self, caches):
@@ -1010,8 +1008,6 @@ class TestSVDDecodeScratchLifecycle(unittest.TestCase):
 
         self.assertEqual(vis_cache.steps_since_compress, 31)
         kv_pool.compress_visual_tokens.assert_not_called()
-
-
 class TestSVDFusedDecodeVisualIdentity(unittest.TestCase):
     def test_fused_single_uses_visual_positions_for_released_visual_cache(self):
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend

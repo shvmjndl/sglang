@@ -1264,6 +1264,42 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             .clone()
         )
 
+    def _visual_slots_are_page_exclusive(
+        self,
+        req_to_token_row: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_slot_indices: torch.Tensor,
+        page_size: int,
+    ) -> bool:
+        """Return whether every touched KV page is referenced only by visual tokens."""
+        if page_size <= 1:
+            return True
+
+        live_slots = req_to_token_row.to(device=req_to_token_row.device, dtype=torch.int64)
+        live_slot_mask = live_slots > 0
+        if not torch.any(live_slot_mask):
+            return True
+
+        visual_mask = torch.zeros(
+            req_to_token_row.shape[0], dtype=torch.bool, device=req_to_token_row.device
+        )
+        visual_mask[visual_positions] = True
+
+        touched_pages = torch.unique(
+            visual_slot_indices.to(device=req_to_token_row.device, dtype=torch.int64)
+            // page_size
+        )
+        live_pages = live_slots // page_size
+        for page_idx in touched_pages:
+            page_positions = torch.nonzero(
+                live_slot_mask & (live_pages == page_idx), as_tuple=True
+            )[0]
+            if page_positions.numel() == 0:
+                continue
+            if not torch.all(visual_mask[page_positions]):
+                return False
+        return True
+
     def compress_visual_tokens(
         self,
         layer_id: int,
@@ -1477,39 +1513,49 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         req_to_token_row: torch.Tensor,
         visual_token_positions: torch.Tensor,
         token_to_kv_pool_allocator,
-    ):
-        """Release long-lived dense visual slots after prefill compression.
-
-        The compressed cache becomes the source of truth. Dense visual slots are
-        removed from the request row and returned to the allocator. Decode can
-        temporarily materialize them later using scratch slots.
-        """
+    ) -> bool:
+        """Release dense visual slots only when their pages are not shared."""
         vis_cache = self.visual_caches.get(int(req_pool_idx))
         if vis_cache is None or not vis_cache.is_compressed:
-            return
+            return False
         if vis_cache.visual_slot_indices is None or len(vis_cache.visual_slot_indices) == 0:
-            return
+            return False
 
         visual_positions = visual_token_positions.to(
             device=req_to_token_row.device, dtype=torch.int64
         )
         visual_positions = visual_positions[visual_positions < req_to_token_row.shape[0]]
         if len(visual_positions) == 0:
-            return
+            return False
 
         slots_to_free = vis_cache.visual_slot_indices.to(
             device=self.device, dtype=torch.int64
         ).clone()
+        vis_cache.visual_token_positions = visual_positions.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+
+        page_size = max(getattr(token_to_kv_pool_allocator, "page_size", self.page_size), 1)
+        if not self._visual_slots_are_page_exclusive(
+            req_to_token_row=req_to_token_row,
+            visual_positions=visual_positions,
+            visual_slot_indices=slots_to_free,
+            page_size=page_size,
+        ):
+            logger.debug(
+                "Skipping dense visual KV release for req_pool_idx=%s because the "
+                "visual span shares at least one page with live non-visual tokens.",
+                req_pool_idx,
+            )
+            return False
 
         req_to_token_row[visual_positions] = 0
         token_to_kv_pool_allocator.free(slots_to_free)
 
-        vis_cache.visual_token_positions = visual_positions.to(
-            device=self.device, dtype=torch.int64
-        ).clone()
         vis_cache.visual_slot_indices = None
         vis_cache.scratch_slot_allocation = None
         vis_cache.released_dense_visual_slots = True
+        return True
 
     def activate_visual_scratch(
         self,

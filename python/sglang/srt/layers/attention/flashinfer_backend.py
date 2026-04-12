@@ -437,24 +437,34 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             has_svd_scratch = False
-            if forward_batch.forward_mode.is_decode():
-                has_svd_scratch = self._maybe_activate_svd_scratch(
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    batch_size=forward_batch.batch_size,
-                    kv_pool=forward_batch.token_to_kv_pool,
-                    req_to_token=forward_batch.req_to_token_pool.req_to_token,
+            try:
+                if forward_batch.forward_mode.is_decode():
+                    has_svd_scratch = self._maybe_activate_svd_scratch(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        batch_size=forward_batch.batch_size,
+                        kv_pool=forward_batch.token_to_kv_pool,
+                        req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                    )
+                self.indices_updater_decode.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    decode_wrappers=self.decode_wrappers,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                    fixed_split_size=self.decode_split_tile_size,
+                    disable_split_kv=False,
                 )
-            self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                decode_wrappers=self.decode_wrappers,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-                fixed_split_size=self.decode_split_tile_size,
-                disable_split_kv=False,
-            )
+            except Exception:
+                if forward_batch.forward_mode.is_decode():
+                    self._cleanup_svd_scratch_rows(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        batch_size=forward_batch.batch_size,
+                        kv_pool=forward_batch.token_to_kv_pool,
+                        req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                    )
+                raise
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, has_svd_scratch=has_svd_scratch
             )
@@ -606,26 +616,45 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             if needed_new_scratch and scratch_slots is not None:
                 activated_req_rows.append((req_pool_idx, req_to_token_row))
-            has_svd_scratch = has_svd_scratch or scratch_slots is not None
+            has_svd_scratch = has_svd_scratch or (
+                vis_cache is not None
+                and vis_cache.is_compressed
+                and vis_cache.released_dense_visual_slots
+                and scratch_slots is not None
+            )
 
         return has_svd_scratch
+
+    def _cleanup_svd_scratch_rows(
+        self,
+        req_pool_indices: torch.Tensor,
+        batch_size: int,
+        kv_pool,
+        req_to_token,
+    ) -> None:
+        if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
+            return
+
+        allocator = self.indices_updater_decode.token_to_kv_pool_allocator
+        for i in range(batch_size):
+            req_pool_idx = req_pool_indices[i].item()
+            req_to_token_row = req_to_token[req_pool_idx]
+            kv_pool.deactivate_visual_scratch(
+                req_pool_idx=req_pool_idx,
+                req_to_token_row=req_to_token_row,
+                token_to_kv_pool_allocator=allocator,
+            )
 
     def finish_forward_metadata(self, forward_batch: ForwardBatch):
         if not forward_batch.forward_mode.is_decode():
             return
 
-        kv_pool = forward_batch.token_to_kv_pool
-        if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
-            return
-
-        for i in range(forward_batch.batch_size):
-            req_pool_idx = forward_batch.req_pool_indices[i].item()
-            req_to_token_row = forward_batch.req_to_token_pool.req_to_token[req_pool_idx]
-            kv_pool.deactivate_visual_scratch(
-                req_pool_idx=req_pool_idx,
-                req_to_token_row=req_to_token_row,
-                token_to_kv_pool_allocator=self.indices_updater_decode.token_to_kv_pool_allocator,
-            )
+        self._cleanup_svd_scratch_rows(
+            req_pool_indices=forward_batch.req_pool_indices,
+            batch_size=forward_batch.batch_size,
+            kv_pool=forward_batch.token_to_kv_pool,
+            req_to_token=forward_batch.req_to_token_pool.req_to_token,
+        )
 
     def init_cuda_graph_state(
         self,
@@ -673,41 +702,52 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         if forward_mode.is_decode_or_idle():
             has_svd_scratch = False
-            if forward_mode.is_decode():
-                has_svd_scratch = self._maybe_activate_svd_scratch(
-                    req_pool_indices=req_pool_indices,
-                    batch_size=bs,
-                    kv_pool=self.indices_updater_decode.token_to_kv_pool_allocator.get_kvcache(),
-                    req_to_token=self.indices_updater_decode.req_to_token,
-                )
-            decode_wrappers = []
-            for i in range(self.num_wrappers):
-                decode_wrappers.append(
-                    BatchDecodeWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.decode_backend,
-                        use_cuda_graph=True,
-                        use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buffer=self.kv_last_page_len[
-                            :num_tokens
-                        ],
+            kv_pool = self.indices_updater_decode.token_to_kv_pool_allocator.get_kvcache()
+            try:
+                if forward_mode.is_decode():
+                    has_svd_scratch = self._maybe_activate_svd_scratch(
+                        req_pool_indices=req_pool_indices,
+                        batch_size=bs,
+                        kv_pool=kv_pool,
+                        req_to_token=self.indices_updater_decode.req_to_token,
                     )
+                decode_wrappers = []
+                for i in range(self.num_wrappers):
+                    decode_wrappers.append(
+                        BatchDecodeWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.decode_backend,
+                            use_cuda_graph=True,
+                            use_tensor_cores=self.decode_use_tensor_cores,
+                            paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                            paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buffer=self.kv_last_page_len[
+                                :num_tokens
+                            ],
+                        )
+                    )
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_decode.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens.cpu(),  # may add a little overhead in capture stage
+                    seq_lens_sum,
+                    decode_wrappers=decode_wrappers,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                    fixed_split_size=None,
+                    disable_split_kv=self.disable_cuda_graph_kv_split,
                 )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_decode.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                decode_wrappers=decode_wrappers,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
-            )
+            except Exception:
+                if forward_mode.is_decode():
+                    self._cleanup_svd_scratch_rows(
+                        req_pool_indices=req_pool_indices,
+                        batch_size=bs,
+                        kv_pool=kv_pool,
+                        req_to_token=self.indices_updater_decode.req_to_token,
+                    )
+                raise
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(
                 decode_wrappers, has_svd_scratch=has_svd_scratch
@@ -1098,22 +1138,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
 
-        # --- Non-fused path: decompress to slots, then use FlashInfer ---
-        # (Fused kernel path for per-request attention is below but requires
-        # single-request batching; for batched decode we use decompress-to-slots)
-
         use_fused = (
             self.svd_fused_kernel
             and forward_batch.batch_size == 1
             and layer.logit_cap in (0, None)
-            # TODO(xx): Re-enable fused decode for released-visual requests.
-            # Today released-visual decode activates step-local scratch, which
-            # disables the fused path because downstream post-attention logic
-            # still assumes visual full KV is available via slots.
-            # Remaining blockers:
-            # 1. _svd_update_importance() still reads visual/all keys from slots.
-            # 2. _svd_check_recompression() still refreshes from slot-backed
-            #    full visual KV instead of tensor-backed fused outputs.
+            # Released visual KV still needs the slot-backed decode path today.
             and not getattr(self.forward_metadata, "has_svd_scratch", False)
         )
 
@@ -1339,10 +1368,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if vis_cache is None or not vis_cache.is_compressed:
                 continue
             if vis_cache.released_dense_visual_slots:
-                # Once dense visual slots have been released, the compressed
-                # factors become the long-lived source of truth. Decode may
-                # materialize approximate scratch KV for one step, but we should
-                # not feed that transient data back into periodic recompression.
+                # Scratch-backed decode KV should not feed periodic recompression.
                 continue
 
             vis_cache.steps_since_compress += 1

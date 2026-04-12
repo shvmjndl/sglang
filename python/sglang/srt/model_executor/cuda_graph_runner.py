@@ -1143,24 +1143,30 @@ class CudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
 
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-        else:
-            # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-
-        # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
-        else:
-            graph_key = self.bs
         try:
+            if not skip_attn_backend_init:
+                self.replay_prepare(forward_batch, pp_proxy_tensors)
+            else:
+                # Speculative decoding still needs these fields.
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
+                )
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
+                )
+
+            # Replay
+            if self.enable_pdmux:
+                graph_key = f"{get_current_stream_idx()}_{self.bs}"
+            else:
+                graph_key = self.bs
             self.graphs[graph_key].replay()
             output = self.output_buffers[graph_key]
         finally:
             if self.enable_pdmux:
-                self.model_runner.decode_attn_backend.finish_forward_metadata(forward_batch)
+                self.model_runner.decode_attn_backend.finish_forward_metadata(
+                    forward_batch
+                )
             else:
                 self.model_runner.attn_backend.finish_forward_metadata(forward_batch)
 
