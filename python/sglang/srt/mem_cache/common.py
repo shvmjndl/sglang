@@ -24,6 +24,15 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
+def _free_nonzero_kv_indices(token_to_kv_pool_allocator, kv_indices: torch.Tensor):
+    if kv_indices.numel() == 0:
+        return
+    valid_indices = kv_indices[kv_indices > 0]
+    if valid_indices.numel() == 0:
+        return
+    token_to_kv_pool_allocator.free(valid_indices)
+
+
 @triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -524,7 +533,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        _free_nonzero_kv_indices(tree_cache.token_to_kv_pool_allocator, indices_to_free)
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()

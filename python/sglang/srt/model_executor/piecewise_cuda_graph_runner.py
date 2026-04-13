@@ -747,38 +747,41 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
-            with set_forward_context(
-                static_forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-            ):
-                output = self.model_runner.model.forward(
-                    static_forward_batch.input_ids,
-                    static_forward_batch.positions,
+            try:
+                with set_forward_context(
                     static_forward_batch,
-                    **kwargs,
-                )
-                if isinstance(output, LogitsProcessorOutput):
-                    return LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[
-                            : self.raw_num_tokens
-                        ],
-                        hidden_states=(
-                            output.hidden_states[: self.raw_num_tokens]
-                            if output.hidden_states is not None
-                            else None
-                        ),
+                    self.attention_layers,
+                    self.quant_config,
+                    self.moe_layers,
+                    self.moe_fusions,
+                ):
+                    output = self.model_runner.model.forward(
+                        static_forward_batch.input_ids,
+                        static_forward_batch.positions,
+                        static_forward_batch,
+                        **kwargs,
                     )
-                elif isinstance(output, EmbeddingPoolerOutput):
-                    return output
-                else:
-                    assert isinstance(output, PPProxyTensors)
-                    # TODO(Yuwei): support PP Support
-                    raise NotImplementedError(
-                        "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
-                    )
+                    if isinstance(output, LogitsProcessorOutput):
+                        return LogitsProcessorOutput(
+                            next_token_logits=output.next_token_logits[
+                                : self.raw_num_tokens
+                            ],
+                            hidden_states=(
+                                output.hidden_states[: self.raw_num_tokens]
+                                if output.hidden_states is not None
+                                else None
+                            ),
+                        )
+                    elif isinstance(output, EmbeddingPoolerOutput):
+                        return output
+                    else:
+                        assert isinstance(output, PPProxyTensors)
+                        # TODO(Yuwei): support PP Support
+                        raise NotImplementedError(
+                            "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
+                        )
+            finally:
+                self.model_runner.attn_backend.finish_forward_metadata(forward_batch)
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

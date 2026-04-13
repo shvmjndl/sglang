@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -94,6 +95,7 @@ class MultiItemScoringParams:
 @dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    has_svd_scratch: bool = False
 
 
 @dataclass
@@ -434,6 +436,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
+            has_svd_scratch = False
+            if forward_batch.forward_mode.is_decode():
+                has_svd_scratch = self._maybe_activate_svd_scratch(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    batch_size=forward_batch.batch_size,
+                    kv_pool=forward_batch.token_to_kv_pool,
+                    req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                )
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -445,7 +455,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                self.decode_wrappers, has_svd_scratch=has_svd_scratch
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -521,6 +533,100 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params,
             )
 
+    def _maybe_activate_svd_scratch(
+        self,
+        req_pool_indices: torch.Tensor,
+        batch_size: int,
+        kv_pool,
+        req_to_token,
+    ) -> bool:
+        has_svd_scratch = False
+        if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
+            return has_svd_scratch
+
+        allocator = self.indices_updater_decode.token_to_kv_pool_allocator
+        page_size = max(getattr(allocator, "page_size", 1), 1)
+        required_scratch_tokens = 0
+        for i in range(batch_size):
+            req_pool_idx = req_pool_indices[i].item()
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            if vis_cache is None or not vis_cache.is_compressed:
+                continue
+            if not vis_cache.released_dense_visual_slots:
+                continue
+            if vis_cache.visual_slot_indices is not None:
+                continue
+            if (
+                vis_cache.visual_token_positions is None
+                or len(vis_cache.visual_token_positions) == 0
+            ):
+                continue
+            required_scratch_tokens += ceil_align(vis_cache.num_tokens, page_size)
+
+        available_scratch_tokens = allocator.available_size()
+        if required_scratch_tokens > available_scratch_tokens:
+            raise RuntimeError(
+                "Insufficient KV scratch capacity before decode: "
+                f"required={required_scratch_tokens}, "
+                f"available={available_scratch_tokens}. "
+                "check_decode_mem() should have reserved this headroom."
+            )
+
+        activated_req_rows = []
+        for i in range(batch_size):
+            req_pool_idx = req_pool_indices[i].item()
+            req_to_token_row = req_to_token[req_pool_idx]
+            vis_cache = kv_pool.get_visual_cache(req_pool_idx)
+            needed_new_scratch = (
+                vis_cache is not None
+                and vis_cache.is_compressed
+                and vis_cache.released_dense_visual_slots
+                and vis_cache.visual_slot_indices is None
+                and vis_cache.visual_token_positions is not None
+                and len(vis_cache.visual_token_positions) > 0
+            )
+            scratch_slots = kv_pool.activate_visual_scratch(
+                req_pool_idx=req_pool_idx,
+                req_to_token_row=req_to_token_row,
+                token_to_kv_pool_allocator=allocator,
+            )
+            if needed_new_scratch and scratch_slots is None:
+                for activated_req_pool_idx, activated_req_to_token_row in reversed(
+                    activated_req_rows
+                ):
+                    kv_pool.deactivate_visual_scratch(
+                        req_pool_idx=activated_req_pool_idx,
+                        req_to_token_row=activated_req_to_token_row,
+                        token_to_kv_pool_allocator=allocator,
+                    )
+                raise RuntimeError(
+                    "Visual scratch activation failed after preflight for "
+                    f"req_pool_idx={req_pool_idx}. This indicates unexpected KV "
+                    "allocator state drift during decode setup."
+                )
+            if needed_new_scratch and scratch_slots is not None:
+                activated_req_rows.append((req_pool_idx, req_to_token_row))
+            has_svd_scratch = has_svd_scratch or scratch_slots is not None
+
+        return has_svd_scratch
+
+    def finish_forward_metadata(self, forward_batch: ForwardBatch):
+        if not forward_batch.forward_mode.is_decode():
+            return
+
+        kv_pool = forward_batch.token_to_kv_pool
+        if not (self.svd_enabled and isinstance(kv_pool, MHATokenToKVPoolSVD)):
+            return
+
+        for i in range(forward_batch.batch_size):
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            req_to_token_row = forward_batch.req_to_token_pool.req_to_token[req_pool_idx]
+            kv_pool.deactivate_visual_scratch(
+                req_pool_idx=req_pool_idx,
+                req_to_token_row=req_to_token_row,
+                token_to_kv_pool_allocator=self.indices_updater_decode.token_to_kv_pool_allocator,
+            )
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -566,6 +672,14 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
+            has_svd_scratch = False
+            if forward_mode.is_decode():
+                has_svd_scratch = self._maybe_activate_svd_scratch(
+                    req_pool_indices=req_pool_indices,
+                    batch_size=bs,
+                    kv_pool=self.indices_updater_decode.token_to_kv_pool_allocator.get_kvcache(),
+                    req_to_token=self.indices_updater_decode.req_to_token,
+                )
             decode_wrappers = []
             for i in range(self.num_wrappers):
                 decode_wrappers.append(
@@ -595,7 +709,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                decode_wrappers, has_svd_scratch=has_svd_scratch
+            )
             for i in range(self.num_wrappers):
                 decode_wrappers[i].begin_forward = partial(
                     fast_decode_plan, decode_wrappers[i]
@@ -715,6 +831,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+            )
+            self.forward_metadata = DecodeMetadata(
+                self.decode_cuda_graph_metadata[bs],
+                has_svd_scratch=getattr(self.forward_metadata, "has_svd_scratch", False),
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -986,6 +1106,15 @@ class FlashInferAttnBackend(AttentionBackend):
             self.svd_fused_kernel
             and forward_batch.batch_size == 1
             and layer.logit_cap in (0, None)
+            # TODO(xx): Re-enable fused decode for released-visual requests.
+            # Today released-visual decode activates step-local scratch, which
+            # disables the fused path because downstream post-attention logic
+            # still assumes visual full KV is available via slots.
+            # Remaining blockers:
+            # 1. _svd_update_importance() still reads visual/all keys from slots.
+            # 2. _svd_check_recompression() still refreshes from slot-backed
+            #    full visual KV instead of tensor-backed fused outputs.
+            and not getattr(self.forward_metadata, "has_svd_scratch", False)
         )
 
         if use_fused:
@@ -1040,6 +1169,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         Uses the custom Triton kernel that fuses decompression with attention,
         avoiding materializing full-size K/V in HBM.
+
+        TODO(xx): The attention computation below no longer needs long-lived
+        dense visual slots once visual/non-visual separation is done by
+        visual_token_positions. To make released-visual fused decode fully
+        usable, follow-up work still needs to remove slot dependencies from:
+          1. _svd_update_importance()
+          2. _svd_check_recompression()
         """
         from sglang.srt.layers.attention.triton_ops.svd_decode_attention import (
             svd_fused_decode_attention,
@@ -1068,13 +1204,30 @@ class FlashInferAttnBackend(AttentionBackend):
         # Get all slot indices for this request
         all_slots = forward_batch.req_to_token_pool.req_to_token[req_pool_row][:seq_len]
 
-        # Visual slots are in compressed form — exclude them (GPU-native)
-        visual_slots = vis_cache.visual_slot_indices
-        if visual_slots is not None and len(visual_slots) > 0:
-            uncomp_mask = ~torch.isin(all_slots, visual_slots)
-            uncomp_slots = all_slots[uncomp_mask]
+        # Visual token positions are the canonical request-level identity.
+        # Prefer excluding compressed visual tokens by logical position so
+        # released-visual requests do not depend on long-lived dense slots.
+        visual_positions = vis_cache.visual_token_positions
+        if visual_positions is not None and len(visual_positions) > 0:
+            pos_mask = torch.zeros(
+                seq_len, dtype=torch.bool, device=all_slots.device
+            )
+            valid_visual_positions = visual_positions.to(
+                device=all_slots.device, dtype=torch.int64
+            )
+            valid_visual_positions = valid_visual_positions[
+                valid_visual_positions < seq_len
+            ]
+            pos_mask[valid_visual_positions] = True
+            uncomp_slots = all_slots[~pos_mask]
         else:
-            uncomp_slots = all_slots
+            # Fallback for older caches that still track visual identity by slot.
+            visual_slots = vis_cache.visual_slot_indices
+            if visual_slots is not None and len(visual_slots) > 0:
+                uncomp_mask = ~torch.isin(all_slots, visual_slots)
+                uncomp_slots = all_slots[uncomp_mask]
+            else:
+                uncomp_slots = all_slots
 
         # Gather uncompressed K/V from the standard pool
         k_uncomp = kv_pool._get_key_buffer(layer_id)[uncomp_slots]     # [T_u, H, D]
@@ -1211,6 +1364,12 @@ class FlashInferAttnBackend(AttentionBackend):
             req_pool_idx = forward_batch.req_pool_indices[i].item()
             vis_cache = kv_pool.get_visual_cache(req_pool_idx)
             if vis_cache is None or not vis_cache.is_compressed:
+                continue
+            if vis_cache.released_dense_visual_slots:
+                # Once dense visual slots have been released, the compressed
+                # factors become the long-lived source of truth. Decode may
+                # materialize approximate scratch KV for one step, but we should
+                # not feed that transient data back into periodic recompression.
                 continue
 
             vis_cache.steps_since_compress += 1
@@ -1935,6 +2094,10 @@ class FlashInferMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def finish_forward_metadata(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backends:
+            attn_backend.finish_forward_metadata(forward_batch)
 
 
 def should_use_tensor_core(

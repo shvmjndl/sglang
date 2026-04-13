@@ -40,11 +40,6 @@ from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -75,6 +70,21 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+
+
+def _get_index_buf_accessor():
+    from sglang.srt.layers.attention.nsa import index_buf_accessor
+
+    return index_buf_accessor
+
+
+def _get_quantize_k_cache_fns():
+    from sglang.srt.layers.attention.nsa.quant_k_cache import (
+        quantize_k_cache,
+        quantize_k_cache_separate,
+    )
+
+    return quantize_k_cache, quantize_k_cache_separate
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1089,6 +1099,9 @@ class PerRequestVisualCache:
         "is_compressed",
         "steps_since_compress",
         "visual_slot_indices",
+        "visual_token_positions",
+        "released_dense_visual_slots",
+        "scratch_slot_allocation",
         "_orig_dtype",
         "_quantized",
     )
@@ -1108,7 +1121,11 @@ class PerRequestVisualCache:
         self.rank_v = rank_v
         self.is_compressed = False
         self.steps_since_compress = 0
+        # Final resolved visual slots after prefix-cache remap has stabilized.
         self.visual_slot_indices: Optional[torch.Tensor] = None
+        self.visual_token_positions: Optional[torch.Tensor] = None
+        self.released_dense_visual_slots = False
+        self.scratch_slot_allocation: Optional[torch.Tensor] = None
         self._orig_dtype = None
         self._quantized = False
 
@@ -1212,6 +1229,41 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
     def get_visual_cache(self, req_pool_idx: int) -> Optional[PerRequestVisualCache]:
         return self.visual_caches.get(int(req_pool_idx))
 
+    def resolve_visual_slots(
+        self,
+        req_to_token_row: torch.Tensor,
+        visual_token_positions: Optional[torch.Tensor],
+        prompt_len: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """Resolve canonical visual token positions to the request's current slots.
+
+        This helper must be called only after prefix-cache finalization has
+        updated req_to_token_pool for the request. It converts request-local
+        visual token positions into the physical KV slots used by decode.
+        """
+        if visual_token_positions is None or len(visual_token_positions) == 0:
+            return None
+
+        if prompt_len is None:
+            prompt_len = req_to_token_row.shape[0]
+        if prompt_len <= 0:
+            return None
+
+        if req_to_token_row.device != visual_token_positions.device:
+            visual_token_positions = visual_token_positions.to(req_to_token_row.device)
+
+        visual_token_positions = visual_token_positions[
+            visual_token_positions < prompt_len
+        ]
+        if len(visual_token_positions) == 0:
+            return None
+
+        return (
+            req_to_token_row[:prompt_len][visual_token_positions]
+            .to(device=self.device, dtype=torch.int64)
+            .clone()
+        )
+
     def compress_visual_tokens(
         self,
         layer_id: int,
@@ -1232,6 +1284,9 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         if vis_cache is None or len(visual_slot_indices) == 0:
             return
 
+        visual_slot_indices = visual_slot_indices.to(
+            device=self.device, dtype=torch.int64
+        )
         T_v = len(visual_slot_indices)
         l = layer_id - self.start_layer
 
@@ -1266,7 +1321,7 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         vis_cache.importance[l] = torch.zeros(
             T_v, dtype=torch.float32, device=self.device
         )
-        vis_cache.visual_slot_indices = visual_slot_indices
+        vis_cache.visual_slot_indices = visual_slot_indices.clone()
         vis_cache.is_compressed = True
 
     def decompress_kv(
@@ -1360,7 +1415,7 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             return
 
         l = layer_id - self.start_layer
-        slots = vis_cache.visual_slot_indices
+        slots = vis_cache.visual_slot_indices.to(device=self.device, dtype=torch.int64)
 
         # Write decompressed KV back to the standard buffer
         if self.store_dtype != self.dtype:
@@ -1405,6 +1460,9 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
     ):
         """Compress visual tokens across all layers for a request.
         Called after prefill completes."""
+        visual_slot_indices = visual_slot_indices.to(
+            device=self.device, dtype=torch.int64
+        )
         vis_cache = self.alloc_visual_cache(
             req_pool_idx, len(visual_slot_indices)
         )
@@ -1412,6 +1470,126 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
 
         for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
             self.compress_visual_tokens(layer_id, req_pool_idx, visual_slot_indices)
+
+    def release_visual_slots_after_prefill(
+        self,
+        req_pool_idx: int,
+        req_to_token_row: torch.Tensor,
+        visual_token_positions: torch.Tensor,
+        token_to_kv_pool_allocator,
+    ):
+        """Release long-lived dense visual slots after prefill compression.
+
+        The compressed cache becomes the source of truth. Dense visual slots are
+        removed from the request row and returned to the allocator. Decode can
+        temporarily materialize them later using scratch slots.
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return
+        if vis_cache.visual_slot_indices is None or len(vis_cache.visual_slot_indices) == 0:
+            return
+
+        visual_positions = visual_token_positions.to(
+            device=req_to_token_row.device, dtype=torch.int64
+        )
+        visual_positions = visual_positions[visual_positions < req_to_token_row.shape[0]]
+        if len(visual_positions) == 0:
+            return
+
+        slots_to_free = vis_cache.visual_slot_indices.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+
+        req_to_token_row[visual_positions] = 0
+        token_to_kv_pool_allocator.free(slots_to_free)
+
+        vis_cache.visual_token_positions = visual_positions.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.scratch_slot_allocation = None
+        vis_cache.released_dense_visual_slots = True
+
+    def activate_visual_scratch(
+        self,
+        req_pool_idx: int,
+        req_to_token_row: torch.Tensor,
+        token_to_kv_pool_allocator,
+    ) -> Optional[torch.Tensor]:
+        """Materialize per-step visual scratch slots for decode."""
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return None
+        if not vis_cache.released_dense_visual_slots:
+            return vis_cache.visual_slot_indices
+        if vis_cache.visual_token_positions is None or len(vis_cache.visual_token_positions) == 0:
+            return None
+        if vis_cache.visual_slot_indices is not None:
+            return vis_cache.visual_slot_indices
+
+        need_slots = len(vis_cache.visual_token_positions)
+        page_size = max(getattr(token_to_kv_pool_allocator, "page_size", 1), 1)
+        alloc_size = ((need_slots + page_size - 1) // page_size) * page_size
+
+        scratch_allocation = token_to_kv_pool_allocator.alloc(alloc_size)
+        scratch_slots = (
+            None
+            if scratch_allocation is None
+            else scratch_allocation[:need_slots]
+        )
+        if scratch_slots is None:
+            logger.warning(
+                "Failed to allocate visual scratch slots for req_pool_idx=%s: "
+                "need_slots=%s alloc_size=%s available_size=%s",
+                req_pool_idx,
+                need_slots,
+                alloc_size,
+                token_to_kv_pool_allocator.available_size(),
+            )
+            return None
+
+        visual_positions = vis_cache.visual_token_positions.to(
+            device=req_to_token_row.device, dtype=torch.int64
+        )
+        req_to_token_row[visual_positions] = scratch_slots.to(req_to_token_row.dtype)
+        vis_cache.visual_slot_indices = scratch_slots.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+        vis_cache.scratch_slot_allocation = scratch_allocation.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+        return vis_cache.visual_slot_indices
+
+    def deactivate_visual_scratch(
+        self,
+        req_pool_idx: int,
+        req_to_token_row: torch.Tensor,
+        token_to_kv_pool_allocator,
+    ):
+        """Release step-local visual scratch slots after decode completes."""
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or vis_cache.visual_slot_indices is None:
+            return
+        if not vis_cache.released_dense_visual_slots:
+            return
+
+        if vis_cache.visual_token_positions is not None and len(vis_cache.visual_token_positions) > 0:
+            visual_positions = vis_cache.visual_token_positions.to(
+                device=req_to_token_row.device, dtype=torch.int64
+            )
+            req_to_token_row[visual_positions] = 0
+
+        slots_to_free = (
+            vis_cache.scratch_slot_allocation
+            if vis_cache.scratch_slot_allocation is not None
+            else vis_cache.visual_slot_indices
+        )
+        token_to_kv_pool_allocator.free(
+            slots_to_free.to(device=self.device, dtype=torch.int64)
+        )
+        vis_cache.visual_slot_indices = None
+        vis_cache.scratch_slot_allocation = None
 
     def decompress_all_layers_to_slots(self, req_pool_idx: int):
         """Decompress visual KV across all layers back to slot pool.
@@ -1430,7 +1608,12 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             return {"compressed": False}
 
         if not vis_cache.is_compressed or vis_cache.k_compressed[0] is None:
-            return {"compressed": False, "num_visual_tokens": vis_cache.num_tokens}
+            return {
+                "compressed": False,
+                "num_visual_tokens": vis_cache.num_tokens,
+                "released_dense_visual_slots": vis_cache.released_dense_visual_slots,
+                "has_active_scratch": vis_cache.visual_slot_indices is not None,
+            }
 
         T_v = vis_cache.num_tokens
         elem_size = self.dtype.itemsize if hasattr(self.dtype, 'itemsize') else torch.tensor([], dtype=self.dtype).element_size()
@@ -1450,6 +1633,8 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             "compression_ratio": original_bytes / max(compressed_bytes, 1),
             "rank_k": self.rank_k,
             "rank_v": self.rank_v,
+            "released_dense_visual_slots": vis_cache.released_dense_visual_slots,
+            "has_active_scratch": vis_cache.visual_slot_indices is not None,
         }
 
 
@@ -2060,6 +2245,7 @@ class MLATokenToKVPool(KVCache):
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
+            _, quantize_k_cache_separate = _get_quantize_k_cache_fns()
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
                 cache_k_nope, cache_k_rope
             )
@@ -2234,6 +2420,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+            quantize_k_cache, _ = _get_quantize_k_cache_fns()
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
@@ -2359,7 +2546,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetK.execute(
+        return _get_index_buf_accessor().GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
@@ -2370,7 +2557,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetS.execute(
+        return _get_index_buf_accessor().GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
@@ -2394,7 +2581,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  k_scale: (seq_len, 4), uint8
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetKAndS.execute(
+        return _get_index_buf_accessor().GetKAndS.execute(
             self,
             buf,
             page_indices=page_indices,
@@ -2411,7 +2598,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
+        _get_index_buf_accessor().SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 

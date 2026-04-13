@@ -632,11 +632,10 @@ class Req(ReqDllmMixin):
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
 
-        # AttentionPack: positions of visual tokens in the input sequence
-        # Computed during prefill to identify which KV cache slots to compress
+        # AttentionPack: canonical visual token identity for this request.
+        # These positions stay stable even if prefix-cache remaps slot indices.
         self.visual_token_positions: Optional[torch.Tensor] = None
-        # Accumulated visual slot indices across chunked prefill chunks
-        self.svd_accumulated_visual_slots: Optional[torch.Tensor] = None
+        self.svd_first_visual_pos: Optional[int] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -875,6 +874,7 @@ class Req(ReqDllmMixin):
         """
         if self.multimodal_inputs is None:
             self.visual_token_positions = None
+            self.svd_first_visual_pos = None
             return
 
         mm = self.multimodal_inputs
@@ -902,8 +902,10 @@ class Req(ReqDllmMixin):
             self.visual_token_positions = torch.tensor(
                 visual_positions, dtype=torch.int64
             )
+            self.svd_first_visual_pos = visual_positions[0]
         else:
             self.visual_token_positions = None
+            self.svd_first_visual_pos = None
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -1173,7 +1175,6 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
-        self.svd_accumulated_visual_slots = None  # Clear stale SVD state on retraction
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1733,10 +1734,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
-        # AttentionPack: compute visual token slot indices for SVD compression
-        if get_global_server_args().enable_svd_kv_cache:
-            self._compute_svd_visual_slot_indices(reqs, prefix_lens, out_cache_loc)
-
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
@@ -1769,55 +1766,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
-
-    def _compute_svd_visual_slot_indices(self, reqs, prefix_lens, out_cache_loc):
-        """Compute which KV cache slot indices correspond to visual tokens.
-
-        Maps visual token positions in the input sequence to their allocated
-        KV pool slot indices for SVD compression.
-        """
-        svd_visual_slot_indices = []
-        offset = 0
-        for i, req in enumerate(reqs):
-            extend_len = req.extend_input_len
-            pre_len = prefix_lens[i]
-
-            # Compute visual positions if not done yet
-            if req.visual_token_positions is None:
-                req.compute_visual_token_positions()
-
-            chunk_visual_slots = None
-            if req.visual_token_positions is not None and len(req.visual_token_positions) > 0:
-                vp = req.visual_token_positions
-                # Visual positions that fall in this extend range (current chunk)
-                in_range = (vp >= pre_len) & (vp < pre_len + extend_len)
-                visual_pos_local = vp[in_range] - pre_len
-
-                if len(visual_pos_local) > 0:
-                    # Map to cache slot indices
-                    chunk_visual_slots = out_cache_loc[offset + visual_pos_local].clone()
-
-            # Accumulate across chunks for chunked prefill
-            if chunk_visual_slots is not None:
-                if req.svd_accumulated_visual_slots is not None:
-                    req.svd_accumulated_visual_slots = torch.cat([
-                        req.svd_accumulated_visual_slots,
-                        chunk_visual_slots.cpu(),
-                    ])
-                else:
-                    req.svd_accumulated_visual_slots = chunk_visual_slots.cpu()
-
-            # Return the FULL accumulated set (all chunks so far)
-            if req.svd_accumulated_visual_slots is not None:
-                svd_visual_slot_indices.append(
-                    req.svd_accumulated_visual_slots.to(out_cache_loc.device)
-                )
-            else:
-                svd_visual_slot_indices.append(None)
-
-            offset += extend_len
-
-        self.svd_visual_slot_indices = svd_visual_slot_indices
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -1968,8 +1916,56 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # v2 eagle has over-allocation
         return num_tokens * (1 + self.is_spec_v2)
 
+    def visual_scratch_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ) -> int:
+        """Return the temporary scratch KV budget needed for released visual caches."""
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            return 0
+
+        if not server_args.enable_svd_kv_cache:
+            return 0
+
+        allocator = self.token_to_kv_pool_allocator
+        get_kvcache = getattr(allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return 0
+
+        kv_pool = get_kvcache()
+        get_visual_cache = getattr(kv_pool, "get_visual_cache", None)
+        if get_visual_cache is None:
+            return 0
+
+        page_size = max(getattr(allocator, "page_size", 1), 1)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+
+        total_tokens = 0
+        for req in requests:
+            if req.req_pool_idx is None:
+                continue
+
+            vis_cache = get_visual_cache(req.req_pool_idx)
+            if vis_cache is None or not vis_cache.is_compressed:
+                continue
+            if not vis_cache.released_dense_visual_slots:
+                continue
+
+            total_tokens += ceil_align(vis_cache.num_tokens, page_size)
+
+        return total_tokens
+
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        decode_tokens = self.new_tokens_required_next_decode(selected_indices)
+        scratch_tokens = self.visual_scratch_tokens_required_next_decode(
+            selected_indices
+        )
+        num_tokens = decode_tokens + scratch_tokens
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
@@ -2614,7 +2610,7 @@ class ModelWorkerBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # AttentionPack: per-request visual token slot indices for SVD compression
+    # Deprecated: decode scratch now resolves visual slots from visual_caches directly.
     svd_visual_slot_indices: Optional[List[Optional[torch.Tensor]]] = None
 
     # For mamba state tracking

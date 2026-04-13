@@ -347,9 +347,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
 
-    # AttentionPack: per-request visual token slot indices (propagated from scheduler).
-    # Compression is triggered from process_batch_result_prefill, not from the attention
-    # backend. This field is available for future per-layer fused kernel use.
+    # Deprecated: decode scratch now resolves visual slots from visual_caches directly.
+    # This field is kept temporarily to avoid broader plumbing churn.
     svd_visual_slot_indices: Optional[List[Optional[torch.Tensor]]] = None
 
     # Encoder-decoder
