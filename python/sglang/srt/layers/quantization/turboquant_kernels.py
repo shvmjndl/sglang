@@ -171,6 +171,21 @@ class HadamardTransform:
         self.signs = _generate_random_signs(self.padded_dim, seed, device)
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
+        self.q_matrix=self.random_orthogonal_torch(self.padded_dim,self.device)
+
+    def random_orthogonal_torch(
+        self,
+        d:int,
+        device=None,
+        dtype=torch.float32,
+    )->torch.Tensor:
+        G = torch.randn((d, d), device=device, dtype=dtype)
+        Q, R = torch.linalg.qr(G, mode="reduced")
+
+        signs = torch.sign(torch.diagonal(R))
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        Q = Q * signs.unsqueeze(0)
+        return Q
 
     def _apply_hadamard(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the unscaled Hadamard transform H*x using the fastest available backend."""
@@ -188,19 +203,8 @@ class HadamardTransform:
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
-        d = x.shape[-1]
 
-        # Pad to power-of-2 if needed
-        if d < self.padded_dim:
-            x = torch.nn.functional.pad(x, (0, self.padded_dim - d))
-
-        # Apply random signs
-        x = x * self.signs
-
-        # Fast Walsh-Hadamard Transform
-        x = self._apply_hadamard(x)
-
-        return x * self.scale
+        return x@self.q_matrix
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
@@ -209,9 +213,7 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        x = self._apply_hadamard(y) * self.scale
-        x = x * self.signs
-        return x[..., : self.dim]
+        return y @(self.q_matrix.transpose(-2,-1))
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +832,7 @@ def turboquant_quantize(
 
     # Compute L2 norms before rotation (preserved by orthogonal transform)
     norms = torch.norm(x.float(), dim=-1)
+    x_clone_normalized=x.clone().float()/(norms.unsqueeze(-1)+1e-10)
 
     # Step 1: Rotate via randomized Hadamard
     rotated = hadamard.forward(x.float())  # (num_tokens, padded_dim)
@@ -881,9 +884,11 @@ def turboquant_quantize(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        residual = rotated_normalized - dequant_normalized
-        residual_norms = torch.norm(residual, dim=-1)
+        recovered_x=hadamard.inverse(dequant_normalized)
+        residual=x_clone_normalized-recovered_x
 
+        residual_norms = torch.norm(residual, dim=-1)
+        residual=hadamard.forward(residual)
         # QJL: store sign bits of residual (1 bit per coordinate)
         qjl_signs_raw = (residual >= 0).to(torch.uint8)
         # Pack QJL signs at 1-bit
@@ -975,20 +980,20 @@ def turboquant_dequantize(
 
     # Add QJL correction if mode="prod"
     if mode == "prod" and "qjl_signs" in quantized:
+        dequant=hadamard.inverse(dequant)
         qjl_packed = quantized["qjl_signs"]
         residual_norms = quantized["residual_norms"]
         qjl_unpacked = unpack_indices(qjl_packed, 1, padded_dim).float()
         qjl_signs = qjl_unpacked * 2.0 - 1.0
-        qjl_scale = math.sqrt(math.pi / 2) / padded_dim
+        qjl_scale = math.sqrt(math.pi / 2 / padded_dim) 
+        qjl_signs=hadamard.inverse(qjl_signs)
         dequant += qjl_scale * residual_norms.unsqueeze(-1) * qjl_signs
 
     # Rescale by original norm
     dequant = dequant * norms.unsqueeze(-1)
 
-    # Inverse Hadamard to get back to original space
-    reconstructed = hadamard.inverse(dequant)
 
-    return reconstructed.to(output_dtype)
+    return dequant.to(output_dtype)
 
 
 # ---------------------------------------------------------------------------
