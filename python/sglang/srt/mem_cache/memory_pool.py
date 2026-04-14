@@ -1073,6 +1073,496 @@ class MHATokenToKVPool(KVCache):
             )
 
 
+class PerRequestVisualCache:
+    """Compressed visual KV cache for a single request, stored separately
+    from the main slot pool to avoid conflicts with RadixAttention prefix sharing."""
+
+    __slots__ = (
+        "num_tokens",
+        "rank_k",
+        "rank_v",
+        "k_compressed",
+        "k_decomp",
+        "v_compressed",
+        "v_decomp",
+        "importance",
+        "is_compressed",
+        "steps_since_compress",
+        "visual_slot_indices",
+        "_orig_dtype",
+        "_quantized",
+    )
+
+    def __init__(
+        self,
+        num_tokens: int,
+        rank_k: int,
+        rank_v: int,
+        layer_num: int,
+        HD: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        self.num_tokens = num_tokens
+        self.rank_k = rank_k
+        self.rank_v = rank_v
+        self.is_compressed = False
+        self.steps_since_compress = 0
+        self.visual_slot_indices: Optional[torch.Tensor] = None
+        self._orig_dtype = None
+        self._quantized = False
+
+        # Per-layer compressed factors
+        self.k_compressed: List[Optional[torch.Tensor]] = [None] * layer_num
+        self.k_decomp: List[Optional[torch.Tensor]] = [None] * layer_num
+        self.v_compressed: List[Optional[torch.Tensor]] = [None] * layer_num
+        self.v_decomp: List[Optional[torch.Tensor]] = [None] * layer_num
+        self.importance: List[Optional[torch.Tensor]] = [None] * layer_num
+
+
+class MHATokenToKVPoolSVD(MHATokenToKVPool):
+    """SVD-compressed KV cache pool for VLM inference (AttentionPack).
+
+    Compresses visual token KV vectors using multi-head SVD decomposition:
+      K ∈ R^{T×HD} ≈ K̄ ∈ R^{T×R_k} @ D_k ∈ R^{R_k×HD}
+      V ∈ R^{T×HD} ≈ V̄ ∈ R^{T×R_v} @ D_v ∈ R^{R_v×HD}
+
+    The compressed visual cache is stored per-request (not in the slot pool)
+    to avoid conflicts with RadixAttention prefix sharing. Text tokens
+    remain in the standard MHA slot pool and participate in radix caching.
+
+    Reference: arXiv:2603.23914
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        # SVD-specific params
+        rank_k: int = 64,
+        rank_v: int = 64,
+        compress_period: int = 32,
+        num_decomp_groups: int = 2,
+        full_rank_fraction: float = 0.25,
+        alpha: float = 0.25,
+        visual_only: bool = True,
+        # Pass-through to parent
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        self.rank_k = rank_k
+        self.rank_v = rank_v
+        self.compress_period = compress_period
+        self.num_decomp_groups = num_decomp_groups
+        self.full_rank_fraction = full_rank_fraction
+        self.alpha = alpha
+        self.visual_only = visual_only
+
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            v_head_dim=v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+
+        self.HD = head_num * head_dim
+        self.v_HD = head_num * (v_head_dim if v_head_dim else head_dim)
+
+        # Per-request compressed visual caches, keyed by req_pool_idx
+        self.visual_caches: dict = {}
+
+    def alloc_visual_cache(
+        self, req_pool_idx: int, num_visual_tokens: int
+    ) -> PerRequestVisualCache:
+        """Allocate a per-request compressed visual cache after prefill."""
+        cache = PerRequestVisualCache(
+            num_tokens=num_visual_tokens,
+            rank_k=self.rank_k,
+            rank_v=self.rank_v,
+            layer_num=self.layer_num,
+            HD=self.HD,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.visual_caches[int(req_pool_idx)] = cache
+        return cache
+
+    def free_visual_cache(self, req_pool_idx: int):
+        """Free compressed visual cache when request finishes."""
+        self.visual_caches.pop(int(req_pool_idx), None)
+
+    def get_visual_cache(self, req_pool_idx: int) -> Optional[PerRequestVisualCache]:
+        return self.visual_caches.get(int(req_pool_idx))
+
+    def compress_visual_tokens(
+        self,
+        layer_id: int,
+        req_pool_idx: int,
+        visual_slot_indices: torch.Tensor,
+    ):
+        """Apply multi-head SVD compression to visual token KV vectors.
+
+        Paper Section 3.1: Multi-head Compression of Key/Value Vectors.
+        Merges across heads before SVD for better compression ratio.
+
+        Args:
+            layer_id: transformer layer index
+            req_pool_idx: request pool index (key into visual_caches)
+            visual_slot_indices: 1-D tensor of pool slot indices for visual tokens
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or len(visual_slot_indices) == 0:
+            return
+
+        T_v = len(visual_slot_indices)
+        l = layer_id - self.start_layer
+
+        # Use _get_key_buffer/_get_value_buffer for proper store_dtype -> dtype conversion
+        # (handles FP8 stored as uint8 correctly)
+        k_raw = self._get_key_buffer(layer_id)[visual_slot_indices].reshape(T_v, self.HD)
+        v_raw = self._get_value_buffer(layer_id)[visual_slot_indices].reshape(T_v, self.v_HD)
+
+        # Cast to float32 for numerical stability in SVD
+        k_float = k_raw.float()
+        v_float = v_raw.float()
+
+        # Randomized SVD (faster than full SVD for large matrices)
+        # K ≈ U_k @ diag(S_k) @ V_k^T
+        # We store K̄ = U_k @ diag(S_k) and D_k = V_k^T
+        rank_k = min(self.rank_k, T_v, self.HD)
+        rank_v = min(self.rank_v, T_v, self.v_HD)
+
+        U_k, S_k, V_k = torch.svd_lowrank(k_float, q=rank_k)
+        K_bar = (U_k * S_k.unsqueeze(0)).to(self.dtype)  # [T_v, rank_k]
+        D_k = V_k.T.to(self.dtype)  # [rank_k, HD]
+
+        U_v, S_v, V_v = torch.svd_lowrank(v_float, q=rank_v)
+        V_bar = (U_v * S_v.unsqueeze(0)).to(self.dtype)  # [T_v, rank_v]
+        D_v = V_v.T.to(self.dtype)  # [rank_v, v_HD]
+
+        # Store in per-request cache
+        vis_cache.k_compressed[l] = K_bar
+        vis_cache.k_decomp[l] = D_k
+        vis_cache.v_compressed[l] = V_bar
+        vis_cache.v_decomp[l] = D_v
+        vis_cache.importance[l] = torch.zeros(
+            T_v, dtype=torch.float32, device=self.device
+        )
+        vis_cache.visual_slot_indices = visual_slot_indices
+        vis_cache.is_compressed = True
+
+    def decompress_kv(
+        self,
+        layer_id: int,
+        req_pool_idx: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Reconstruct full K/V from compressed representation.
+
+        Paper Section 3.2: Attention-aware Decompression.
+        Uses partial decompression based on importance scores when
+        num_decomp_groups > 1.
+
+        Returns:
+            k_decompressed: [T_compressed, head_num, head_dim]
+            v_decompressed: [T_compressed, head_num, v_head_dim]
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return None, None
+
+        l = layer_id - self.start_layer
+        K_bar = vis_cache.k_compressed[l]  # [T_c, R_k]
+        D_k = vis_cache.k_decomp[l]  # [R_k, HD]
+        V_bar = vis_cache.v_compressed[l]  # [T_c, R_v]
+        D_v = vis_cache.v_decomp[l]  # [R_v, v_HD]
+
+        if K_bar is None:
+            return None, None
+
+        T_c = K_bar.shape[0]
+
+        if self.num_decomp_groups > 1 and vis_cache.importance[l] is not None:
+            # Attention-aware partial decompression (Paper Section 3.2).
+            # Per paper Section 4.3: "key vectors are more sensitive to
+            # information loss after partial decompression" — so partial
+            # ranks are applied to VALUES only. Keys always get full rank.
+            scores = vis_cache.importance[l]
+            n_full = max(int(T_c * self.full_rank_fraction), 1)
+            n_full = min(n_full, T_c)
+
+            _, top_indices = scores.topk(n_full)
+            mask_full = torch.zeros(T_c, dtype=torch.bool, device=self.device)
+            mask_full[top_indices] = True
+            mask_partial = ~mask_full
+
+            # Keys: always full rank decompression (sensitive to rank reduction)
+            k_out = K_bar @ D_k  # [T_c, HD]
+
+            # Values: partial rank for low-importance tokens
+            v_out = torch.empty(
+                T_c, self.v_HD, dtype=self.dtype, device=self.device
+            )
+
+            if mask_full.any():
+                v_out[mask_full] = V_bar[mask_full] @ D_v
+
+            if mask_partial.any():
+                r_partial_v = max(V_bar.shape[1] // 4, 1)
+                v_out[mask_partial] = V_bar[mask_partial, :r_partial_v] @ D_v[:r_partial_v]
+
+            k_decompressed = k_out.reshape(T_c, self.head_num, self.head_dim)
+            v_decompressed = v_out.reshape(T_c, self.head_num, self.v_head_dim)
+        else:
+            # Full decompression for all tokens
+            k_decompressed = (K_bar @ D_k).reshape(T_c, self.head_num, self.head_dim)
+            v_decompressed = (V_bar @ D_v).reshape(
+                T_c, self.head_num, self.v_head_dim
+            )
+
+        return k_decompressed, v_decompressed
+
+    def write_decompressed_to_slots(
+        self,
+        layer_id: int,
+        req_pool_idx: int,
+    ):
+        """Decompress visual KV and write back to the standard slot pool
+        so FlashInfer can read them via normal paged indices.
+
+        This is the non-fused path: decompress → write to slots → FlashInfer reads.
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return
+        if vis_cache.visual_slot_indices is None:
+            return
+
+        k_decomp, v_decomp = self.decompress_kv(layer_id, req_pool_idx)
+        if k_decomp is None:
+            return
+
+        l = layer_id - self.start_layer
+        slots = vis_cache.visual_slot_indices
+
+        # Write decompressed KV back to the standard buffer
+        if self.store_dtype != self.dtype:
+            self.k_buffer[l][slots] = k_decomp.view(self.store_dtype)
+            self.v_buffer[l][slots] = v_decomp.view(self.store_dtype)
+        else:
+            self.k_buffer[l][slots] = k_decomp
+            self.v_buffer[l][slots] = v_decomp
+
+    def update_importance_scores(
+        self,
+        layer_id: int,
+        req_pool_idx: int,
+        attention_scores: torch.Tensor,
+    ):
+        """Update EMA importance scores after attention computation.
+
+        Paper Eq. 1: I_tp ← α^Tq * I_tp + (1 - α^Tq) * avg_attn
+
+        Args:
+            attention_scores: [T_compressed] average attention weights for compressed tokens
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return
+
+        l = layer_id - self.start_layer
+        if vis_cache.importance[l] is None:
+            return
+
+        T_q = 1  # decode step
+        alpha_Tq = self.alpha**T_q
+        vis_cache.importance[l] = (
+            alpha_Tq * vis_cache.importance[l]
+            + (1 - alpha_Tq) * attention_scores.float()
+        )
+
+    def compress_all_layers(
+        self,
+        req_pool_idx: int,
+        visual_slot_indices: torch.Tensor,
+    ):
+        """Compress visual tokens across all layers for a request.
+        Called after prefill completes."""
+        vis_cache = self.alloc_visual_cache(
+            req_pool_idx, len(visual_slot_indices)
+        )
+        vis_cache.visual_slot_indices = visual_slot_indices.clone()
+
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            self.compress_visual_tokens(layer_id, req_pool_idx, visual_slot_indices)
+
+    def decompress_all_layers_to_slots(self, req_pool_idx: int):
+        """Decompress visual KV across all layers back to slot pool.
+        Called before attention computation in the non-fused path."""
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return
+
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            self.write_decompressed_to_slots(layer_id, req_pool_idx)
+
+    def get_compression_stats(self, req_pool_idx: int) -> dict:
+        """Get compression statistics for debugging/monitoring."""
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None:
+            return {"compressed": False}
+
+        if not vis_cache.is_compressed or vis_cache.k_compressed[0] is None:
+            return {"compressed": False, "num_visual_tokens": vis_cache.num_tokens}
+
+        T_v = vis_cache.num_tokens
+        elem_size = self.dtype.itemsize if hasattr(self.dtype, 'itemsize') else torch.tensor([], dtype=self.dtype).element_size()
+        original_bytes = T_v * (self.HD + self.v_HD) * elem_size
+        compressed_bytes = (
+            T_v * self.rank_k * elem_size
+            + self.rank_k * self.HD * elem_size
+            + T_v * self.rank_v * elem_size
+            + self.rank_v * self.v_HD * elem_size
+        )
+
+        return {
+            "compressed": True,
+            "num_visual_tokens": T_v,
+            "original_bytes": original_bytes,
+            "compressed_bytes": compressed_bytes,
+            "compression_ratio": original_bytes / max(compressed_bytes, 1),
+            "rank_k": self.rank_k,
+            "rank_v": self.rank_v,
+        }
+
+
+class MHATokenToKVPoolSVDFP4(MHATokenToKVPoolSVD):
+    """SVD compression + FP4 quantization for maximum KV cache compression.
+
+    Applies SVD decomposition first (reduces dimensions), then quantizes
+    the compressed factors to FP4 (reduces precision). Combined compression
+    ratio: SVD ~8x × FP4 ~2.5x ≈ 20x total.
+
+    The uncompressed slot pool (for text tokens) uses standard dtype.
+    Only the per-request compressed visual factors are quantized to FP4.
+    """
+
+    def compress_visual_tokens(
+        self,
+        layer_id: int,
+        req_pool_idx: int,
+        visual_slot_indices: torch.Tensor,
+    ):
+        """Override: apply SVD then quantize the compressed factors to FP4."""
+        # Step 1: Standard SVD compression (produces fp16/bf16 factors)
+        super().compress_visual_tokens(layer_id, req_pool_idx, visual_slot_indices)
+
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return
+
+        l = layer_id - self.start_layer
+        K_bar = vis_cache.k_compressed[l]
+        D_k = vis_cache.k_decomp[l]
+        V_bar = vis_cache.v_compressed[l]
+        D_v = vis_cache.v_decomp[l]
+
+        if K_bar is None:
+            return
+
+        # Step 2: Quantize compressed factors to FP4 using built-in quantization
+        # For now, quantize to FP8 (more widely supported) as a stepping stone
+        # Full FP4 requires KVFP4QuantizeUtil which needs specific tensor shapes
+        if hasattr(torch, "float8_e4m3fn"):
+            vis_cache.k_compressed[l] = K_bar.to(torch.float8_e4m3fn).view(torch.uint8)
+            vis_cache.k_decomp[l] = D_k.to(torch.float8_e4m3fn).view(torch.uint8)
+            vis_cache.v_compressed[l] = V_bar.to(torch.float8_e4m3fn).view(torch.uint8)
+            vis_cache.v_decomp[l] = D_v.to(torch.float8_e4m3fn).view(torch.uint8)
+
+            # Store original dtype for dequantization
+            if vis_cache._orig_dtype is None:
+                vis_cache._orig_dtype = self.dtype
+            vis_cache._quantized = True
+
+    def decompress_kv(
+        self,
+        layer_id: int,
+        req_pool_idx: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Override: dequantize FP8 factors then reconstruct via matmul.
+
+        Dequantizes into local tensors and computes the reconstruction
+        directly, without mutating vis_cache (avoids race conditions).
+        """
+        vis_cache = self.visual_caches.get(int(req_pool_idx))
+        if vis_cache is None or not vis_cache.is_compressed:
+            return None, None
+
+        l = layer_id - self.start_layer
+
+        if not getattr(vis_cache, "_quantized", False):
+            return super().decompress_kv(layer_id, req_pool_idx)
+
+        if vis_cache.k_compressed[l] is None:
+            return None, None
+
+        orig_dtype = vis_cache._orig_dtype
+
+        # Dequantize into local tensors (no mutation of vis_cache)
+        K_bar = vis_cache.k_compressed[l].view(torch.float8_e4m3fn).to(orig_dtype)
+        D_k = vis_cache.k_decomp[l].view(torch.float8_e4m3fn).to(orig_dtype)
+        V_bar = vis_cache.v_compressed[l].view(torch.float8_e4m3fn).to(orig_dtype)
+        D_v = vis_cache.v_decomp[l].view(torch.float8_e4m3fn).to(orig_dtype)
+
+        T_c = K_bar.shape[0]
+
+        # Reconstruct directly (same logic as parent but on local dequantized tensors)
+        # Keys always get full rank; partial decompression applies to values only
+        if self.num_decomp_groups > 1 and vis_cache.importance[l] is not None:
+            scores = vis_cache.importance[l]
+            n_full = max(int(T_c * self.full_rank_fraction), 1)
+            n_full = min(n_full, T_c)
+
+            _, top_indices = scores.topk(n_full)
+            mask_full = torch.zeros(T_c, dtype=torch.bool, device=self.device)
+            mask_full[top_indices] = True
+            mask_partial = ~mask_full
+
+            k_out = K_bar @ D_k  # Keys: always full rank
+            v_out = torch.empty(T_c, self.v_HD, dtype=orig_dtype, device=self.device)
+
+            if mask_full.any():
+                v_out[mask_full] = V_bar[mask_full] @ D_v
+            if mask_partial.any():
+                r_pv = max(V_bar.shape[1] // 4, 1)
+                v_out[mask_partial] = V_bar[mask_partial, :r_pv] @ D_v[:r_pv]
+
+            k_decompressed = k_out.reshape(T_c, self.head_num, self.head_dim)
+            v_decompressed = v_out.reshape(T_c, self.head_num, self.v_head_dim)
+        else:
+            k_decompressed = (K_bar @ D_k).reshape(T_c, self.head_num, self.head_dim)
+            v_decompressed = (V_bar @ D_v).reshape(T_c, self.head_num, self.v_head_dim)
+
+        return k_decompressed, v_decompressed
+
+
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):

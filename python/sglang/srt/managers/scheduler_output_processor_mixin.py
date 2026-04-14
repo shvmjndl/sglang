@@ -166,6 +166,14 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # AttentionPack: trigger SVD compression now that prefill is fully done
+                    # (including all chunks for chunked prefill)
+                    if (
+                        req.svd_accumulated_visual_slots is not None
+                        and len(req.svd_accumulated_visual_slots) > 0
+                    ):
+                        self._svd_compress_after_prefill(req)
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -1207,3 +1215,50 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts=retraction_counts,
             )
         )
+
+    def _svd_compress_after_prefill(self: Scheduler, req: Req):
+        """Trigger SVD compression of visual tokens after a request's prefill completes.
+
+        Called from process_batch_result_prefill when req.is_chunked <= 0,
+        ensuring all chunks (including chunked prefill) have been processed
+        and all visual token KV data is in the pool.
+
+        Reads slot indices directly from req_to_token_pool at compression time
+        (not from accumulated indices) because cache_unfinished_req may have
+        freed and remapped slots between chunks. Credit: @SohamRajpure
+        """
+        import torch
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+
+        allocator = self.token_to_kv_pool_allocator
+        if not hasattr(allocator, "get_kvcache"):
+            return
+        kv_pool = allocator.get_kvcache()
+        if not isinstance(kv_pool, MHATokenToKVPoolSVD):
+            return
+
+        if req.visual_token_positions is None or len(req.visual_token_positions) == 0:
+            return
+
+        # Read the current post-deduplication slot mapping from req_to_token_pool.
+        # This is the authoritative source — svd_accumulated_visual_slots may hold
+        # stale indices if cache_unfinished_req freed/remapped slots between chunks.
+        seq_len = len(req.fill_ids)
+        all_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :seq_len
+        ]
+
+        # Filter to visual token positions
+        vtp = req.visual_token_positions
+        # Clamp positions to seq_len (visual positions are in origin_input_ids space)
+        valid_mask = vtp < seq_len
+        if not valid_mask.any():
+            return
+        visual_positions = vtp[valid_mask].to(all_slots.device)
+        visual_slots = all_slots[visual_positions]
+
+        # Compression is synchronous (blocks until SVD completes on GPU).
+        # This is intentional: the scheduler loop is sequential, so compression
+        # must finish before get_next_batch_to_run() can schedule this request
+        # for decode.
+        kv_pool.compress_all_layers(req.req_pool_idx, visual_slots)

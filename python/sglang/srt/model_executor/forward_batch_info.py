@@ -347,6 +347,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
 
+    # AttentionPack: per-request visual token slot indices (propagated from scheduler).
+    # Compression is triggered from process_batch_result_prefill, not from the attention
+    # backend. This field is available for future per-layer fused kernel use.
+    svd_visual_slot_indices: Optional[List[Optional[torch.Tensor]]] = None
+
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
     encoder_lens: Optional[torch.Tensor] = None
@@ -478,6 +483,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            svd_visual_slot_indices=getattr(batch, "svd_visual_slot_indices", None),
         )
         device = model_runner.device
 

@@ -1807,6 +1807,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def configure_kv_cache_dtype(self):
+        # Support --kv-cache-dtype svd as alias for --enable-svd-kv-cache
+        if self.server_args.kv_cache_dtype == "svd":
+            self.server_args.enable_svd_kv_cache = True
+            self.kv_cache_dtype = self.dtype
+            log_info_on_rank0(
+                logger,
+                "kv_cache_dtype='svd' → enabling SVD KV cache compression, "
+                f"underlying dtype={self.kv_cache_dtype}",
+            )
+            return
+
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)

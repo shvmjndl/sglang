@@ -23,6 +23,8 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MHATokenToKVPoolSVD,
+    MHATokenToKVPoolSVDFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
@@ -625,6 +627,38 @@ class ModelRunnerKVCacheMixin:
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif self.server_args.enable_svd_kv_cache:
+                    svd_pool_cls = (
+                        MHATokenToKVPoolSVDFP4
+                        if self.server_args.svd_quantize
+                        else MHATokenToKVPoolSVD
+                    )
+                    self.token_to_kv_pool = svd_pool_cls(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        v_head_dim=self.model_config.v_head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        rank_k=self.server_args.svd_rank_k,
+                        rank_v=self.server_args.svd_rank_v,
+                        compress_period=self.server_args.svd_compress_period,
+                        num_decomp_groups=self.server_args.svd_decomp_groups,
+                        full_rank_fraction=self.server_args.svd_full_rank_fraction,
+                        alpha=self.server_args.svd_alpha,
+                        visual_only=self.server_args.svd_visual_only,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,

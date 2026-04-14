@@ -462,6 +462,22 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def _free_svd_visual_cache(tree_cache: BasePrefixCache, req_pool_idx):
+    """Free AttentionPack per-request compressed visual cache if present."""
+    if req_pool_idx is None:
+        return
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return
+    get_kvcache = getattr(allocator, "get_kvcache", None)
+    if get_kvcache is None:
+        return
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+    kv_pool = get_kvcache()
+    if isinstance(kv_pool, MHATokenToKVPoolSVD):
+        kv_pool.free_visual_cache(req_pool_idx)
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
@@ -476,6 +492,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    # AttentionPack: capture req_pool_idx before cache_finished_req may set it to None
+    svd_req_pool_idx = req.req_pool_idx
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
@@ -483,6 +502,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # cleanup (overalloc free + pool slot free). This means over-allocated
     # tokens from speculative decoding are NOT freed between turns.
     if req.req_pool_idx is None:
+        # Still free visual cache even when session takes ownership of KV slots
+        _free_svd_visual_cache(tree_cache, svd_req_pool_idx)
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
@@ -512,6 +533,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+
+    # AttentionPack: free per-request compressed visual cache
+    _free_svd_visual_cache(tree_cache, svd_req_pool_idx)
+
     tree_cache.req_to_token_pool.free(req)
 
 

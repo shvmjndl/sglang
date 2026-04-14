@@ -588,6 +588,18 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # AttentionPack: SVD-based KV Cache Compression (arXiv:2603.23914)
+    enable_svd_kv_cache: bool = False
+    svd_rank_k: int = 64
+    svd_rank_v: int = 64
+    svd_compress_period: int = 32
+    svd_decomp_groups: int = 2
+    svd_full_rank_fraction: float = 0.25
+    svd_alpha: float = 0.25
+    svd_visual_only: bool = True
+    svd_fused_kernel: bool = True
+    svd_quantize: bool = False
+
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -5199,6 +5211,67 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
+        )
+
+        # AttentionPack: SVD KV Cache Compression
+        parser.add_argument(
+            "--enable-svd-kv-cache",
+            action="store_true",
+            help="Enable SVD-based low-rank KV cache compression (AttentionPack). "
+            "Compresses visual token KV vectors using SVD for memory-efficient VLM inference.",
+        )
+        parser.add_argument(
+            "--svd-rank-k",
+            type=int,
+            default=ServerArgs.svd_rank_k,
+            help="Compression rank for key matrices in SVD KV cache.",
+        )
+        parser.add_argument(
+            "--svd-rank-v",
+            type=int,
+            default=ServerArgs.svd_rank_v,
+            help="Compression rank for value matrices in SVD KV cache.",
+        )
+        parser.add_argument(
+            "--svd-compress-period",
+            type=int,
+            default=ServerArgs.svd_compress_period,
+            help="Re-compress uncompressed KV cache every N decode steps.",
+        )
+        parser.add_argument(
+            "--svd-decomp-groups",
+            type=int,
+            default=ServerArgs.svd_decomp_groups,
+            help="Number of importance groups for partial decompression.",
+        )
+        parser.add_argument(
+            "--svd-full-rank-fraction",
+            type=float,
+            default=ServerArgs.svd_full_rank_fraction,
+            help="Fraction of tokens decompressed at full rank (r1 in paper).",
+        )
+        parser.add_argument(
+            "--svd-alpha",
+            type=float,
+            default=ServerArgs.svd_alpha,
+            help="EMA decay factor for attention importance score tracking.",
+        )
+        parser.add_argument(
+            "--svd-visual-only",
+            action="store_true",
+            default=True,
+            help="Only compress visual tokens (recommended, mixing causes quality loss).",
+        )
+        parser.add_argument(
+            "--svd-fused-kernel",
+            action="store_true",
+            default=True,
+            help="Use fused Triton kernel for SVD decompression + attention.",
+        )
+        parser.add_argument(
+            "--svd-quantize",
+            action="store_true",
+            help="Quantize SVD-compressed factors to FP8 for additional compression (~20x total).",
         )
 
         # Offloading
