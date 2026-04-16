@@ -19,6 +19,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -171,6 +172,21 @@ class HadamardTransform:
         self.signs = _generate_random_signs(self.padded_dim, seed, device)
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
+        self.q_matrix=self.random_orthogonal_torch(self.padded_dim,self.device)
+
+    def random_orthogonal_torch(
+        self,
+        d:int,
+        device=None,
+        dtype=torch.float32,
+    )->torch.Tensor:
+        G = torch.randn((d, d), device=device, dtype=dtype)
+        Q, R = torch.linalg.qr(G, mode="reduced")
+
+        signs = torch.sign(torch.diagonal(R))
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        Q = Q * signs.unsqueeze(0)
+        return Q
 
     def _apply_hadamard(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the unscaled Hadamard transform H*x using the fastest available backend."""
@@ -188,19 +204,8 @@ class HadamardTransform:
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
-        d = x.shape[-1]
 
-        # Pad to power-of-2 if needed
-        if d < self.padded_dim:
-            x = torch.nn.functional.pad(x, (0, self.padded_dim - d))
-
-        # Apply random signs
-        x = x * self.signs
-
-        # Fast Walsh-Hadamard Transform
-        x = self._apply_hadamard(x)
-
-        return x * self.scale
+        return x@self.q_matrix
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
@@ -209,9 +214,7 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        x = self._apply_hadamard(y) * self.scale
-        x = x * self.signs
-        return x[..., : self.dim]
+        return y @(self.q_matrix.transpose(-2,-1))
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +553,80 @@ def _fused_signs_scatter_kernel(
         tl.store(output_ptr + out_base + offs, vals, mask=mask)
 
 
+@triton.jit
+def _fused_scatter_kernel(
+    # Input: (N * heads, padded_dim) float32 — post-inverse-rotation
+    input_ptr,
+    # Pool indices
+    indices_ptr,         # [N] int32
+    # Output workspace: [pool, heads, head_dim]
+    output_ptr,
+    output_stride_tok,
+    output_stride_head,
+    # Dims
+    NUM_HEADS: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    OUTPUT_BF16: tl.constexpr,
+):
+    """Scatter: truncate → cast → scatter to workspace. No signs or scale.
+
+    Grid: (N, NUM_HEADS).
+    """
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    in_row = tok_idx * NUM_HEADS + head_idx
+    offs = tl.arange(0, PADDED_DIM)
+    mask = offs < HEAD_DIM
+
+    vals = tl.load(input_ptr + in_row * PADDED_DIM + offs, mask=offs < PADDED_DIM, other=0.0)
+
+    pool_pos = tl.load(indices_ptr + tok_idx)
+    out_base = pool_pos * output_stride_tok + head_idx * output_stride_head
+
+    if OUTPUT_BF16:
+        tl.store(output_ptr + out_base + offs, vals.to(tl.bfloat16), mask=mask)
+    else:
+        tl.store(output_ptr + out_base + offs, vals, mask=mask)
+
+
+@triton.jit
+def _fused_scatter_offset_kernel(
+    # Input: (N * heads, padded_dim) float32 — post-inverse-rotation
+    input_ptr,
+    # Pool indices
+    indices_ptr,         # [N] int32
+    # Output workspace: [pool, heads, head_dim]
+    output_ptr,
+    output_stride_tok,
+    output_stride_head,
+    # Dims
+    NUM_HEADS: tl.constexpr,
+    PADDED_DIM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    OFFSET: tl.constexpr,
+    OUTPUT_BF16: tl.constexpr,
+):
+    """Same as _fused_scatter_kernel but writes at OFFSET in workspace."""
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    in_row = tok_idx * NUM_HEADS + head_idx
+    offs = tl.arange(0, PADDED_DIM)
+    mask = offs < HEAD_DIM
+
+    vals = tl.load(input_ptr + in_row * PADDED_DIM + offs, mask=offs < PADDED_DIM, other=0.0)
+
+    pool_pos = tl.load(indices_ptr + tok_idx)
+    out_base = pool_pos * output_stride_tok + head_idx * output_stride_head + OFFSET
+
+    if OUTPUT_BF16:
+        tl.store(output_ptr + out_base + offs, vals.to(tl.bfloat16), mask=mask)
+    else:
+        tl.store(output_ptr + out_base + offs, vals, mask=mask)
+
+
 def turboquant_dequant_fused(
     packed: torch.Tensor,
     norms: torch.Tensor,
@@ -561,17 +638,17 @@ def turboquant_dequant_fused(
     padded_dim: int,
     skip_hadamard: bool = False,
 ):
-    """Fused dequant: 3 kernels (full) or 2 kernels (rotated-domain).
+    """Fused dequant: 2 kernels (full) or 1 kernel (rotated-domain).
 
     Full mode (skip_hadamard=False):
       1. Triton: gather + unpack + centroid + norm → flat
-      2. CUDA Hadamard in-place
-      3. Triton: signs + scale + truncate + scatter → workspace
+      2. Inverse rotation via Q^T (PyTorch matmul)
+      3. Triton: truncate + cast + scatter → workspace
 
     Rotated-domain mode (skip_hadamard=True):
       1. Triton: gather + unpack + centroid + norm → flat
       2. Triton: truncate + cast + scatter → workspace
-      Skips Hadamard/signs — the attention backend rotates Q/output instead.
+      Skips inverse rotation — the attention backend rotates Q/output instead.
     """
     n_active = indices.shape[0]
     num_heads = packed.shape[1]
@@ -591,21 +668,25 @@ def turboquant_dequant_fused(
     )
 
     if skip_hadamard:
-        # Rotated domain: just truncate + cast + scatter. No signs, no scale.
-        recon = flat[:, :head_dim].reshape(n_active, num_heads, head_dim)
-        if output_bf16:
-            recon = recon.to(workspace.dtype)
-        workspace[indices] = recon
-        return
-    else:
-        flat = hadamard._apply_hadamard(flat)
-        _fused_signs_scatter_kernel[(n_active, num_heads)](
-            flat, hadamard.signs, indices, workspace,
+        # Rotated domain: just truncate + cast + scatter. No inverse rotation.
+        _fused_scatter_kernel[(n_active, num_heads)](
+            flat, indices, workspace,
             workspace.stride(0), workspace.stride(1),
             NUM_HEADS=num_heads,
             PADDED_DIM=padded_dim,
             HEAD_DIM=head_dim,
-            SCALE=hadamard.scale,
+            OUTPUT_BF16=1 if output_bf16 else 0,
+        )
+        return
+    else:
+        # Inverse rotation: flat @ Q^T
+        flat = hadamard.inverse(flat)
+        _fused_scatter_kernel[(n_active, num_heads)](
+            flat, indices, workspace,
+            workspace.stride(0), workspace.stride(1),
+            NUM_HEADS=num_heads,
+            PADDED_DIM=padded_dim,
+            HEAD_DIM=head_dim,
             OUTPUT_BF16=1 if output_bf16 else 0,
         )
 
@@ -669,8 +750,8 @@ def turboquant_dequant_fused_mixed(
 
     Processes hi and lo halves independently through:
     1. Triton: gather + unpack + centroid + norm
-    2. CUDA Hadamard
-    3. Triton: signs + scale + scatter
+    2. Inverse rotation via Q^T (PyTorch matmul)
+    3. Triton: truncate + cast + scatter
     """
     n_active = indices.shape[0]
     num_heads = packed.shape[1]
@@ -698,7 +779,8 @@ def turboquant_dequant_fused_mixed(
         PACKED_DIM=packed_dim_hi,
     )
 
-    flat_hi = hadamard_hi._apply_hadamard(flat_hi)
+    # Inverse rotation: flat_hi @ Q_hi^T
+    flat_hi = hadamard_hi.inverse(flat_hi)
 
     # ── Lo half (3-bit) ──
     flat_lo = torch.empty(n_active * num_heads, padded_lo,
@@ -735,29 +817,27 @@ def turboquant_dequant_fused_mixed(
         c = scaled_centroids_lo
         flat_lo = c[unpacked.long()] * norms_lo[indices].reshape(-1, 1)
 
-    flat_lo = hadamard_lo._apply_hadamard(flat_lo)
+    # Inverse rotation: flat_lo @ Q_lo^T
+    flat_lo = hadamard_lo.inverse(flat_lo)
 
     # ── Scatter both halves to workspace ──
-    _fused_signs_scatter_kernel[(n_active, num_heads)](
-        flat_hi, hadamard_hi.signs, indices, workspace,
+    _fused_scatter_kernel[(n_active, num_heads)](
+        flat_hi, indices, workspace,
         workspace.stride(0), workspace.stride(1),
         NUM_HEADS=num_heads,
         PADDED_DIM=padded_hi,
         HEAD_DIM=split_dim,
-        SCALE=hadamard_hi.scale,
         OUTPUT_BF16=1 if output_bf16 else 0,
     )
 
     # Lo half writes to workspace offset by split_dim
-    # Need a separate scatter kernel that writes at an offset
-    _fused_signs_scatter_offset_kernel[(n_active, num_heads)](
-        flat_lo, hadamard_lo.signs, indices, workspace,
+    _fused_scatter_offset_kernel[(n_active, num_heads)](
+        flat_lo, indices, workspace,
         workspace.stride(0), workspace.stride(1),
         NUM_HEADS=num_heads,
         PADDED_DIM=padded_lo,
         HEAD_DIM=head_dim - split_dim,
         OFFSET=split_dim,
-        SCALE=hadamard_lo.scale,
         OUTPUT_BF16=1 if output_bf16 else 0,
     )
 
@@ -830,9 +910,14 @@ def turboquant_quantize(
 
     # Compute L2 norms before rotation (preserved by orthogonal transform)
     norms = torch.norm(x.float(), dim=-1)
+    x_clone_normalized=x.clone().float()/(norms.unsqueeze(-1)+1e-10)
 
     # Step 1: Rotate via randomized Hadamard
-    rotated = hadamard.forward(x.float())  # (num_tokens, padded_dim)
+    # Pad input to padded_dim if dim is not a power of 2
+    x_float = x.float()
+    if dim < hadamard.padded_dim:
+        x_float = F.pad(x_float, (0, hadamard.padded_dim - dim))
+    rotated = hadamard.forward(x_float)  # (num_tokens, padded_dim)
     padded_dim = rotated.shape[-1]
 
     # Get centroids scaled by 1/sqrt(d) for the coordinate distribution
@@ -881,9 +966,11 @@ def turboquant_quantize(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        residual = rotated_normalized - dequant_normalized
-        residual_norms = torch.norm(residual, dim=-1)
+        recovered_x=hadamard.inverse(dequant_normalized)
+        residual=x_clone_normalized-recovered_x
 
+        residual_norms = torch.norm(residual, dim=-1)
+        residual=hadamard.forward(residual)
         # QJL: store sign bits of residual (1 bit per coordinate)
         qjl_signs_raw = (residual >= 0).to(torch.uint8)
         # Pack QJL signs at 1-bit
@@ -940,9 +1027,9 @@ def turboquant_dequantize(
             PACKED_DIM=packed_dim,
             BLOCK_SIZE=BLOCK_SIZE,
         )
-        # dequant already has norm applied, just do Hadamard inverse
+        # dequant already has norm applied, just do inverse rotation
         reconstructed = hadamard.inverse(dequant)
-        return reconstructed.to(output_dtype)
+        return reconstructed[:, :hadamard.dim].to(output_dtype)
 
     # General path: separate unpack → centroid → QJL correction → norm → Hadamard
     dequant = torch.zeros(num_tokens, padded_dim, dtype=torch.float32, device=device)
@@ -973,22 +1060,23 @@ def turboquant_dequantize(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
+    # Inverse rotation back to original space
+    dequant = hadamard.inverse(dequant)
+
     # Add QJL correction if mode="prod"
     if mode == "prod" and "qjl_signs" in quantized:
         qjl_packed = quantized["qjl_signs"]
         residual_norms = quantized["residual_norms"]
         qjl_unpacked = unpack_indices(qjl_packed, 1, padded_dim).float()
         qjl_signs = qjl_unpacked * 2.0 - 1.0
-        qjl_scale = math.sqrt(math.pi / 2) / padded_dim
+        qjl_scale = math.sqrt(math.pi / 2 / padded_dim)
+        qjl_signs = hadamard.inverse(qjl_signs)
         dequant += qjl_scale * residual_norms.unsqueeze(-1) * qjl_signs
 
     # Rescale by original norm
     dequant = dequant * norms.unsqueeze(-1)
 
-    # Inverse Hadamard to get back to original space
-    reconstructed = hadamard.inverse(dequant)
-
-    return reconstructed.to(output_dtype)
+    return dequant[:, :hadamard.dim].to(output_dtype)
 
 
 # ---------------------------------------------------------------------------
