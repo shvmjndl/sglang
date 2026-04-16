@@ -360,6 +360,38 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
         self.assertTrue(vis_cache.is_compressed)
         self.assertTrue(torch.equal(vis_cache.visual_slot_indices, final_slots))
 
+    def test_compress_all_layers_rolls_back_partial_failure(self):
+        pool = self._make_pool(size=64, head_num=4, head_dim=8, rank_k=4, rank_v=4)
+        req_pool_idx = 0
+        slots = torch.arange(2, dtype=torch.int64)
+        k_data = _seeded_randn(2, 4, 8, dtype=torch.float16, device="cpu", seed=91)
+        v_data = _seeded_randn(2, 4, 8, dtype=torch.float16, device="cpu", seed=92)
+
+        pool.k_buffer[0][slots] = k_data.to(pool.store_dtype)
+        pool.v_buffer[0][slots] = v_data.to(pool.store_dtype)
+
+        original_compress = pool.compress_visual_tokens
+
+        def _compress_then_fail(
+            layer_id, req_pool_idx_arg, visual_slot_indices, mark_compressed=True
+        ):
+            if layer_id == pool.start_layer:
+                return original_compress(
+                    layer_id,
+                    req_pool_idx_arg,
+                    visual_slot_indices,
+                    mark_compressed=mark_compressed,
+                )
+            raise RuntimeError("layer compression failed")
+
+        pool.layer_num = 2
+
+        with patch.object(pool, "compress_visual_tokens", side_effect=_compress_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "layer compression failed"):
+                pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=slots)
+
+        self.assertIsNone(pool.get_visual_cache(req_pool_idx))
+
     def test_release_visual_slots_after_prefill(self):
         """Dense visual slots should be released after compression finalization."""
         from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator

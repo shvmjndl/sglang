@@ -1350,6 +1350,7 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         layer_id: int,
         req_pool_idx: int,
         visual_slot_indices: torch.Tensor,
+        mark_compressed: bool = True,
     ):
         """Apply multi-head SVD compression to visual token KV vectors.
 
@@ -1398,7 +1399,8 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             T_v, dtype=torch.float32, device=self.device
         )
         vis_cache.visual_slot_indices = visual_slot_indices.clone()
-        vis_cache.is_compressed = True
+        if mark_compressed:
+            vis_cache.is_compressed = True
 
     def decompress_kv(
         self,
@@ -1544,8 +1546,19 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         )
         vis_cache.visual_slot_indices = visual_slot_indices.clone()
 
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
-            self.compress_visual_tokens(layer_id, req_pool_idx, visual_slot_indices)
+        try:
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+                self.compress_visual_tokens(
+                    layer_id,
+                    req_pool_idx,
+                    visual_slot_indices,
+                    mark_compressed=False,
+                )
+        except Exception:
+            self.free_visual_cache(req_pool_idx)
+            raise
+
+        vis_cache.is_compressed = True
 
     def release_visual_slots_after_prefill(
         self,
