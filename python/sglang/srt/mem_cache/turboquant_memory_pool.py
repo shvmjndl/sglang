@@ -177,8 +177,12 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         self.store_dtype = torch.uint8
 
         m = self.size + self.page_size
-        k_packed_dim = compute_packed_dim_mixed(self.head_dim, self.bits)
-        v_packed_dim = compute_packed_dim_mixed(self.v_head_dim, self.bits)
+        if self.mode=="mse":
+            k_packed_dim = compute_packed_dim_mixed(self.head_dim, self.bits)
+            v_packed_dim = compute_packed_dim_mixed(self.v_head_dim, self.bits)
+        else:
+            k_packed_dim = compute_packed_dim_mixed(self.head_dim, self.bits-1)
+            v_packed_dim = compute_packed_dim_mixed(self.v_head_dim, self.bits-1)
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -330,7 +334,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         determined by len(indices). Duplicate indices produce redundant but
         correct writes — same data to same position.
 
-        For 4-bit MSE mode, uses the fused path (3 kernels instead of 6+).
+        For 4-bit MSE mode, uses the fused path (Triton gather + Q^T inverse + Triton scatter).
         """
         idx = layer_id - self.start_layer
         indices = self._active_indices
