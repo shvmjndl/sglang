@@ -21,6 +21,21 @@ from unittest.mock import Mock, patch
 import torch
 
 
+def _make_generator(device: str, seed: int) -> torch.Generator:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return generator
+
+
+def _seeded_randn(*shape, device: str, dtype: torch.dtype, seed: int) -> torch.Tensor:
+    return torch.randn(
+        *shape,
+        dtype=dtype,
+        device=device,
+        generator=_make_generator(device, seed),
+    )
+
+
 class TestSVDCompression(unittest.TestCase):
     """Test SVD compression/decompression correctness."""
 
@@ -57,12 +72,12 @@ class TestSVDCompression(unittest.TestCase):
 
         # Generate low-rank-ish data (visual tokens tend to be low-rank)
         # Simulate by generating from a low-rank distribution
-        base_k = torch.randn(T_v, 80, dtype=torch.float16, device="cuda")
-        proj_k = torch.randn(80, H * D, dtype=torch.float16, device="cuda")
+        base_k = _seeded_randn(T_v, 80, dtype=torch.float16, device="cuda", seed=11)
+        proj_k = _seeded_randn(80, H * D, dtype=torch.float16, device="cuda", seed=12)
         k_data = (base_k @ proj_k).reshape(T_v, H, D)
 
-        base_v = torch.randn(T_v, 80, dtype=torch.float16, device="cuda")
-        proj_v = torch.randn(80, H * D, dtype=torch.float16, device="cuda")
+        base_v = _seeded_randn(T_v, 80, dtype=torch.float16, device="cuda", seed=13)
+        proj_v = _seeded_randn(80, H * D, dtype=torch.float16, device="cuda", seed=14)
         v_data = (base_v @ proj_v).reshape(T_v, H, D)
 
         # Write to pool slots
@@ -130,7 +145,7 @@ class TestSVDCompression(unittest.TestCase):
         req_pool_idx = 0
 
         # Same data in both pools
-        k_data = torch.randn(T_v, H, D, dtype=torch.float16, device="cuda")
+        k_data = _seeded_randn(T_v, H, D, dtype=torch.float16, device="cuda", seed=21)
         slots = torch.arange(T_v, dtype=torch.int64, device="cuda")
 
         for pool in [pool_full, pool_partial]:
@@ -333,8 +348,8 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
 
         req_pool_idx = 0
         final_slots = torch.tensor([5, 9], dtype=torch.int64)
-        k_data = torch.randn(2, 4, 8, dtype=torch.float16)
-        v_data = torch.randn(2, 4, 8, dtype=torch.float16)
+        k_data = _seeded_randn(2, 4, 8, dtype=torch.float16, device="cpu", seed=31)
+        v_data = _seeded_randn(2, 4, 8, dtype=torch.float16, device="cpu", seed=32)
 
         pool.k_buffer[0][final_slots] = k_data.to(pool.store_dtype)
         pool.v_buffer[0][final_slots] = v_data.to(pool.store_dtype)
@@ -1081,19 +1096,21 @@ class TestFusedKernel(unittest.TestCase):
             svd_fused_decode_attention,
         )
 
-        torch.manual_seed(42)
-
         B, H_q, H_kv, D = 1, 32, 32, 128
         T_c, R_k, R_v = 64, 32, 32
         T_u = 16
 
-        q = torch.randn(B, H_q, D, dtype=torch.float16, device="cuda")
-        k_bar = torch.randn(T_c, R_k, dtype=torch.float16, device="cuda")
-        d_k = torch.randn(R_k, H_kv * D, dtype=torch.float16, device="cuda")
-        v_bar = torch.randn(T_c, R_v, dtype=torch.float16, device="cuda")
-        d_v = torch.randn(R_v, H_kv * D, dtype=torch.float16, device="cuda")
-        k_uncomp = torch.randn(T_u, H_kv, D, dtype=torch.float16, device="cuda")
-        v_uncomp = torch.randn(T_u, H_kv, D, dtype=torch.float16, device="cuda")
+        q = _seeded_randn(B, H_q, D, dtype=torch.float16, device="cuda", seed=41)
+        k_bar = _seeded_randn(T_c, R_k, dtype=torch.float16, device="cuda", seed=42)
+        d_k = _seeded_randn(R_k, H_kv * D, dtype=torch.float16, device="cuda", seed=43)
+        v_bar = _seeded_randn(T_c, R_v, dtype=torch.float16, device="cuda", seed=44)
+        d_v = _seeded_randn(R_v, H_kv * D, dtype=torch.float16, device="cuda", seed=45)
+        k_uncomp = _seeded_randn(
+            T_u, H_kv, D, dtype=torch.float16, device="cuda", seed=46
+        )
+        v_uncomp = _seeded_randn(
+            T_u, H_kv, D, dtype=torch.float16, device="cuda", seed=47
+        )
         importance = torch.zeros(T_c, dtype=torch.float32, device="cuda")
         sm_scale = 1.0 / (D ** 0.5)
 
@@ -1133,19 +1150,21 @@ class TestFusedKernel(unittest.TestCase):
             svd_fused_decode_attention,
         )
 
-        torch.manual_seed(123)
-
         B, H_q, H_kv, D = 1, 32, 8, 128  # GQA: 4 query heads per KV head
         T_c, R_k, R_v = 32, 16, 16
         T_u = 8
 
-        q = torch.randn(B, H_q, D, dtype=torch.float16, device="cuda")
-        k_bar = torch.randn(T_c, R_k, dtype=torch.float16, device="cuda")
-        d_k = torch.randn(R_k, H_kv * D, dtype=torch.float16, device="cuda")
-        v_bar = torch.randn(T_c, R_v, dtype=torch.float16, device="cuda")
-        d_v = torch.randn(R_v, H_kv * D, dtype=torch.float16, device="cuda")
-        k_uncomp = torch.randn(T_u, H_kv, D, dtype=torch.float16, device="cuda")
-        v_uncomp = torch.randn(T_u, H_kv, D, dtype=torch.float16, device="cuda")
+        q = _seeded_randn(B, H_q, D, dtype=torch.float16, device="cuda", seed=51)
+        k_bar = _seeded_randn(T_c, R_k, dtype=torch.float16, device="cuda", seed=52)
+        d_k = _seeded_randn(R_k, H_kv * D, dtype=torch.float16, device="cuda", seed=53)
+        v_bar = _seeded_randn(T_c, R_v, dtype=torch.float16, device="cuda", seed=54)
+        d_v = _seeded_randn(R_v, H_kv * D, dtype=torch.float16, device="cuda", seed=55)
+        k_uncomp = _seeded_randn(
+            T_u, H_kv, D, dtype=torch.float16, device="cuda", seed=56
+        )
+        v_uncomp = _seeded_randn(
+            T_u, H_kv, D, dtype=torch.float16, device="cuda", seed=57
+        )
         importance = torch.zeros(T_c, dtype=torch.float32, device="cuda")
         sm_scale = 1.0 / (D ** 0.5)
 
@@ -1182,19 +1201,21 @@ class TestFusedKernel(unittest.TestCase):
             svd_fused_decode_attention,
         )
 
-        torch.manual_seed(99)
-
         B, H_q, H_kv, D = 1, 8, 8, 64
         T_c, R_k, R_v = 0, 16, 16
         T_u = 32
 
-        q = torch.randn(B, H_q, D, dtype=torch.float16, device="cuda")
+        q = _seeded_randn(B, H_q, D, dtype=torch.float16, device="cuda", seed=61)
         k_bar = torch.empty(0, R_k, dtype=torch.float16, device="cuda")
-        d_k = torch.randn(R_k, H_kv * D, dtype=torch.float16, device="cuda")
+        d_k = _seeded_randn(R_k, H_kv * D, dtype=torch.float16, device="cuda", seed=62)
         v_bar = torch.empty(0, R_v, dtype=torch.float16, device="cuda")
-        d_v = torch.randn(R_v, H_kv * D, dtype=torch.float16, device="cuda")
-        k_uncomp = torch.randn(T_u, H_kv, D, dtype=torch.float16, device="cuda")
-        v_uncomp = torch.randn(T_u, H_kv, D, dtype=torch.float16, device="cuda")
+        d_v = _seeded_randn(R_v, H_kv * D, dtype=torch.float16, device="cuda", seed=63)
+        k_uncomp = _seeded_randn(
+            T_u, H_kv, D, dtype=torch.float16, device="cuda", seed=64
+        )
+        v_uncomp = _seeded_randn(
+            T_u, H_kv, D, dtype=torch.float16, device="cuda", seed=65
+        )
         importance = torch.empty(0, dtype=torch.float32, device="cuda")
         sm_scale = 1.0 / (D ** 0.5)
 
@@ -1210,6 +1231,90 @@ class TestFusedKernel(unittest.TestCase):
 
         rel_diff = (ref_o.half() - fused_o).norm() / ref_o.half().norm()
         self.assertLess(rel_diff.item(), 0.05, f"T_c=0 case failed: rel_diff={rel_diff:.4f}")
+
+
+class TestSVDFusedKernelHelpers(unittest.TestCase):
+    def test_softmax_epsilon_tracks_input_precision(self):
+        from sglang.srt.layers.attention.triton_ops.svd_decode_attention import (
+            _softmax_lse_epsilon,
+        )
+
+        self.assertEqual(
+            _softmax_lse_epsilon(torch.float16),
+            torch.finfo(torch.float32).eps,
+        )
+        self.assertEqual(
+            _softmax_lse_epsilon(torch.bfloat16),
+            torch.finfo(torch.float32).eps,
+        )
+        self.assertEqual(
+            _softmax_lse_epsilon(torch.float32),
+            torch.finfo(torch.float32).eps,
+        )
+        self.assertEqual(
+            _softmax_lse_epsilon(torch.float64),
+            torch.finfo(torch.float64).eps,
+        )
+
+
+class TestSVDCompressionStrategy(unittest.TestCase):
+    def _make_pool(self, size=512, head_num=4, head_dim=8, rank_k=4, rank_v=4):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
+
+        return MHATokenToKVPoolSVD(
+            size=size,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            rank_k=rank_k,
+            rank_v=rank_v,
+        )
+
+    def test_compress_visual_tokens_uses_exact_svd_for_small_matrices(self):
+        pool = self._make_pool()
+        req_pool_idx = 0
+        slots = torch.arange(2, dtype=torch.int64)
+        k_data = _seeded_randn(2, 4, 8, dtype=torch.float16, device="cpu", seed=71)
+        v_data = _seeded_randn(2, 4, 8, dtype=torch.float16, device="cpu", seed=72)
+        pool.k_buffer[0][slots] = k_data.to(pool.store_dtype)
+        pool.v_buffer[0][slots] = v_data.to(pool.store_dtype)
+        pool.alloc_visual_cache(req_pool_idx, len(slots))
+
+        with patch("torch.linalg.svd", wraps=torch.linalg.svd) as exact_svd, patch(
+            "torch.svd_lowrank", wraps=torch.svd_lowrank
+        ) as randomized_svd:
+            pool.compress_visual_tokens(pool.start_layer, req_pool_idx, slots)
+
+        self.assertGreaterEqual(exact_svd.call_count, 2)
+        self.assertEqual(randomized_svd.call_count, 0)
+
+    def test_compress_visual_tokens_uses_randomized_svd_for_large_low_rank_inputs(self):
+        pool = self._make_pool(
+            size=1024, head_num=16, head_dim=16, rank_k=8, rank_v=8
+        )
+        req_pool_idx = 0
+        slots = torch.arange(256, dtype=torch.int64)
+        k_data = _seeded_randn(
+            256, 16, 16, dtype=torch.float16, device="cpu", seed=73
+        )
+        v_data = _seeded_randn(
+            256, 16, 16, dtype=torch.float16, device="cpu", seed=74
+        )
+        pool.k_buffer[0][slots] = k_data.to(pool.store_dtype)
+        pool.v_buffer[0][slots] = v_data.to(pool.store_dtype)
+        pool.alloc_visual_cache(req_pool_idx, len(slots))
+
+        with patch("torch.linalg.svd", wraps=torch.linalg.svd) as exact_svd, patch(
+            "torch.svd_lowrank", wraps=torch.svd_lowrank
+        ) as randomized_svd:
+            pool.compress_visual_tokens(pool.start_layer, req_pool_idx, slots)
+
+        self.assertEqual(exact_svd.call_count, 0)
+        self.assertGreaterEqual(randomized_svd.call_count, 2)
 
 
 class TestSVDFP4Composition(unittest.TestCase):
@@ -1231,7 +1336,9 @@ class TestSVDFP4Composition(unittest.TestCase):
         slots = torch.arange(T_v, dtype=torch.int64, device="cuda")
 
         # Write data
-        k_data = torch.randn(T_v, 32, 128, dtype=torch.float16, device="cuda")
+        k_data = _seeded_randn(
+            T_v, 32, 128, dtype=torch.float16, device="cuda", seed=81
+        )
         pool.k_buffer[0][slots] = k_data
 
         pool.alloc_visual_cache(0, T_v)

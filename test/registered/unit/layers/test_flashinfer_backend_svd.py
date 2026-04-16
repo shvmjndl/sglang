@@ -15,6 +15,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
+def _seeded_randn(*shape, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return torch.randn(*shape, dtype=torch.float16, generator=generator)
+
+
 class TestFlashInferBackendSVD(CustomTestCase):
     def _make_pool(self, size=64, device="cpu"):
         return MHATokenToKVPoolSVD(
@@ -107,8 +113,8 @@ class TestFlashInferBackendSVD(CustomTestCase):
         pool = self._make_pool()
         req_pool_idx = 0
         final_slots = torch.tensor([5, 9], dtype=torch.int64)
-        k_data = torch.randn(2, 4, 8, dtype=torch.float16)
-        v_data = torch.randn(2, 4, 8, dtype=torch.float16)
+        k_data = _seeded_randn(2, 4, 8, seed=11)
+        v_data = _seeded_randn(2, 4, 8, seed=12)
 
         pool.k_buffer[0][final_slots] = k_data.to(pool.store_dtype)
         pool.v_buffer[0][final_slots] = v_data.to(pool.store_dtype)

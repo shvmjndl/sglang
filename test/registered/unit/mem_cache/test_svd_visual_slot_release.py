@@ -12,6 +12,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
+def _seeded_randn(*shape, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return torch.randn(*shape, dtype=torch.float16, generator=generator)
+
+
 class TestSVDVisualSlotRelease(CustomTestCase):
     def _make_pool(self, size=64, page_size=4):
         return MHATokenToKVPoolSVD(
@@ -28,8 +34,8 @@ class TestSVDVisualSlotRelease(CustomTestCase):
         )
 
     def _write_visual_kv(self, pool, final_slots):
-        k_data = torch.randn(len(final_slots), 4, 8, dtype=torch.float16)
-        v_data = torch.randn(len(final_slots), 4, 8, dtype=torch.float16)
+        k_data = _seeded_randn(len(final_slots), 4, 8, seed=21)
+        v_data = _seeded_randn(len(final_slots), 4, 8, seed=22)
         pool.k_buffer[0][final_slots] = k_data.to(pool.store_dtype)
         pool.v_buffer[0][final_slots] = v_data.to(pool.store_dtype)
 
