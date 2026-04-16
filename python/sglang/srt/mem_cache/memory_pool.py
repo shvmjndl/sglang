@@ -70,6 +70,9 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_SVD_EXACT_SMALL_MATRIX_DIM = 128
+_SVD_EXACT_RANK_FRACTION = 0.75
+_SVD_LOWRANK_OVERSAMPLING = 8
 
 
 def _get_index_buf_accessor():
@@ -1229,6 +1232,48 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
     def get_visual_cache(self, req_pool_idx: int) -> Optional[PerRequestVisualCache]:
         return self.visual_caches.get(int(req_pool_idx))
 
+    @staticmethod
+    def _should_use_exact_svd(
+        num_rows: int, num_cols: int, target_rank: int
+    ) -> bool:
+        min_dim = min(num_rows, num_cols)
+        if min_dim <= _SVD_EXACT_SMALL_MATRIX_DIM:
+            return True
+        return target_rank >= int(min_dim * _SVD_EXACT_RANK_FRACTION)
+
+    def _factorize_visual_matrix(
+        self, matrix: torch.Tensor, target_rank: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_rows, num_cols = matrix.shape
+        min_dim = min(num_rows, num_cols)
+
+        if target_rank <= 0:
+            return (
+                torch.empty(
+                    (num_rows, 0), dtype=self.dtype, device=self.device
+                ),
+                torch.empty(
+                    (0, num_cols), dtype=self.dtype, device=self.device
+                ),
+            )
+
+        if self._should_use_exact_svd(num_rows, num_cols, target_rank):
+            U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+            U = U[:, :target_rank]
+            S = S[:target_rank]
+            Vh = Vh[:target_rank, :]
+        else:
+            oversampled_rank = min(
+                min_dim,
+                target_rank + min(_SVD_LOWRANK_OVERSAMPLING, min_dim - target_rank),
+            )
+            U, S, V = torch.svd_lowrank(matrix, q=oversampled_rank)
+            U = U[:, :target_rank]
+            S = S[:target_rank]
+            Vh = V[:, :target_rank].transpose(0, 1)
+
+        return (U * S.unsqueeze(0)).to(self.dtype), Vh.to(self.dtype)
+
     def resolve_visual_slots(
         self,
         req_to_token_row: torch.Tensor,
@@ -1341,13 +1386,8 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         rank_k = min(self.rank_k, T_v, self.HD)
         rank_v = min(self.rank_v, T_v, self.v_HD)
 
-        U_k, S_k, V_k = torch.svd_lowrank(k_float, q=rank_k)
-        K_bar = (U_k * S_k.unsqueeze(0)).to(self.dtype)  # [T_v, rank_k]
-        D_k = V_k.T.to(self.dtype)  # [rank_k, HD]
-
-        U_v, S_v, V_v = torch.svd_lowrank(v_float, q=rank_v)
-        V_bar = (U_v * S_v.unsqueeze(0)).to(self.dtype)  # [T_v, rank_v]
-        D_v = V_v.T.to(self.dtype)  # [rank_v, v_HD]
+        K_bar, D_k = self._factorize_visual_matrix(k_float, rank_k)
+        V_bar, D_v = self._factorize_visual_matrix(v_float, rank_v)
 
         # Store in per-request cache
         vis_cache.k_compressed[l] = K_bar

@@ -25,6 +25,11 @@ import triton
 import triton.language as tl
 
 
+def _softmax_lse_epsilon(dtype: torch.dtype) -> float:
+    opmath_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    return torch.finfo(opmath_dtype).eps
+
+
 @triton.jit
 def _svd_fused_decode_attention_kernel(
     # Query: [B, H_q, D]
@@ -72,6 +77,7 @@ def _svd_fused_decode_attention_kernel(
     R_k: tl.constexpr,
     R_v: tl.constexpr,
     SM_SCALE: tl.constexpr,
+    LSE_EPS,
     # Block sizes
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -210,7 +216,7 @@ def _svd_fused_decode_attention_kernel(
         l_prev = l_new
 
     # Final normalization (guard against T_c=T_u=0 edge case)
-    l_prev = tl.maximum(l_prev, 1e-6)
+    l_prev = tl.maximum(l_prev, LSE_EPS)
     o_acc = o_acc / l_prev
 
     # Store output
@@ -261,6 +267,7 @@ def svd_fused_decode_attention(
     BLOCK_T = max(min(triton.next_power_of_2(max(T_c, T_u, 1)), 64), 16)
     BLOCK_D = max(triton.next_power_of_2(D), 16)
     BLOCK_R = max(min(triton.next_power_of_2(max(R_k, R_v, 1)), 64), 16)
+    lse_eps = _softmax_lse_epsilon(q.dtype)
 
     grid = (B, H_q)
 
@@ -311,6 +318,7 @@ def svd_fused_decode_attention(
         R_k=R_k,
         R_v=R_v,
         SM_SCALE=sm_scale,
+        LSE_EPS=lse_eps,
         BLOCK_T=BLOCK_T,
         BLOCK_D=BLOCK_D,
         BLOCK_R=BLOCK_R,
