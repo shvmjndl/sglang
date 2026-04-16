@@ -4,7 +4,7 @@ This project integrates [TurboQuant](https://arxiv.org/abs/2502.12139) (ICLR 202
 
 ## What Was Modified
 
-### Core Implementation (new files)
+### Core Implementation
 
 | File | Description |
 |------|-------------|
@@ -21,8 +21,6 @@ This project integrates [TurboQuant](https://arxiv.org/abs/2502.12139) (ICLR 202
 | `python/sglang/srt/layers/quantization/turboquant_kernels.py` | Fixed fused dequant path: replaced old Walsh-Hadamard inverse with `hadamard.inverse()` (Q^T) for consistency with forward Q rotation (0% → 88.5% accuracy) |
 | `python/sglang/srt/layers/quantization/turboquant_kernels.py` | Fixed 1/2/3-bit general dequant: moved `hadamard.inverse()` before QJL block |
 | `python/sglang/srt/layers/quantization/turboquant_kernels.py` | Added input padding for non-power-of-2 head_dim in `turboquant_quantize` |
-| `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py` | KV cache pool initialization support for TurboQuant |
-| `python/sglang/srt/server_args.py` | Added `--turboquant-bits` and `--turboquant-mode` server arguments |
 
 ## Quick Start
 
