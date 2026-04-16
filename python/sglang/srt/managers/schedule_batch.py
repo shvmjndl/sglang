@@ -1955,6 +1955,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             if not vis_cache.released_dense_visual_slots:
                 continue
+            if getattr(vis_cache, "scratch_slot_allocation", None) is not None:
+                continue
 
             total_tokens += ceil_align(vis_cache.num_tokens, page_size)
 

@@ -561,6 +561,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 or len(vis_cache.visual_token_positions) == 0
             ):
                 continue
+            if getattr(vis_cache, "scratch_slot_allocation", None) is not None:
+                continue
             required_scratch_tokens += ceil_align(vis_cache.num_tokens, page_size)
 
         available_scratch_tokens = allocator.available_size()
@@ -582,6 +584,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 and vis_cache.is_compressed
                 and vis_cache.released_dense_visual_slots
                 and vis_cache.visual_slot_indices is None
+                and getattr(vis_cache, "scratch_slot_allocation", None) is None
                 and vis_cache.visual_token_positions is not None
                 and len(vis_cache.visual_token_positions) > 0
             )
@@ -598,6 +601,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         req_pool_idx=activated_req_pool_idx,
                         req_to_token_row=activated_req_to_token_row,
                         token_to_kv_pool_allocator=allocator,
+                        free_allocation=True,
                     )
                 raise RuntimeError(
                     "Visual scratch activation failed after preflight for "

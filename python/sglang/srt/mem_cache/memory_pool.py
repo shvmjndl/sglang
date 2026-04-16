@@ -1222,9 +1222,18 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         self.visual_caches[int(req_pool_idx)] = cache
         return cache
 
-    def free_visual_cache(self, req_pool_idx: int):
+    def free_visual_cache(self, req_pool_idx: int, token_to_kv_pool_allocator=None):
         """Free compressed visual cache when request finishes."""
-        self.visual_caches.pop(int(req_pool_idx), None)
+        vis_cache = self.visual_caches.pop(int(req_pool_idx), None)
+        if (
+            vis_cache is None
+            or vis_cache.scratch_slot_allocation is None
+            or token_to_kv_pool_allocator is None
+        ):
+            return
+        token_to_kv_pool_allocator.free(
+            vis_cache.scratch_slot_allocation.to(device=self.device, dtype=torch.int64)
+        )
 
     def get_visual_cache(self, req_pool_idx: int) -> Optional[PerRequestVisualCache]:
         return self.visual_caches.get(int(req_pool_idx))
@@ -1529,34 +1538,34 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             return vis_cache.visual_slot_indices
 
         need_slots = len(vis_cache.visual_token_positions)
-        page_size = max(getattr(token_to_kv_pool_allocator, "page_size", 1), 1)
-        alloc_size = ((need_slots + page_size - 1) // page_size) * page_size
+        scratch_allocation = vis_cache.scratch_slot_allocation
+        if scratch_allocation is None:
+            page_size = max(getattr(token_to_kv_pool_allocator, "page_size", 1), 1)
+            alloc_size = ((need_slots + page_size - 1) // page_size) * page_size
+            scratch_allocation = token_to_kv_pool_allocator.alloc(alloc_size)
+            if scratch_allocation is None:
+                logger.warning(
+                    "Failed to allocate visual scratch slots for req_pool_idx=%s: "
+                    "need_slots=%s alloc_size=%s available_size=%s",
+                    req_pool_idx,
+                    need_slots,
+                    alloc_size,
+                    token_to_kv_pool_allocator.available_size(),
+                )
+                return None
+            vis_cache.scratch_slot_allocation = scratch_allocation.to(
+                device=self.device, dtype=torch.int64
+            ).clone()
 
-        scratch_allocation = token_to_kv_pool_allocator.alloc(alloc_size)
-        scratch_slots = (
-            None
-            if scratch_allocation is None
-            else scratch_allocation[:need_slots]
-        )
-        if scratch_slots is None:
-            logger.warning(
-                "Failed to allocate visual scratch slots for req_pool_idx=%s: "
-                "need_slots=%s alloc_size=%s available_size=%s",
-                req_pool_idx,
-                need_slots,
-                alloc_size,
-                token_to_kv_pool_allocator.available_size(),
-            )
-            return None
+        scratch_slots = scratch_allocation[:need_slots]
 
         visual_positions = vis_cache.visual_token_positions.to(
             device=req_to_token_row.device, dtype=torch.int64
         )
-        req_to_token_row[visual_positions] = scratch_slots.to(req_to_token_row.dtype)
+        req_to_token_row[visual_positions] = scratch_slots.to(
+            device=req_to_token_row.device, dtype=req_to_token_row.dtype
+        )
         vis_cache.visual_slot_indices = scratch_slots.to(
-            device=self.device, dtype=torch.int64
-        ).clone()
-        vis_cache.scratch_slot_allocation = scratch_allocation.to(
             device=self.device, dtype=torch.int64
         ).clone()
         return vis_cache.visual_slot_indices
@@ -1566,8 +1575,9 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         req_pool_idx: int,
         req_to_token_row: torch.Tensor,
         token_to_kv_pool_allocator,
+        free_allocation: bool = False,
     ):
-        """Release step-local visual scratch slots after decode completes."""
+        """Clear step-local visual scratch mappings after decode completes."""
         vis_cache = self.visual_caches.get(int(req_pool_idx))
         if vis_cache is None or vis_cache.visual_slot_indices is None:
             return
@@ -1580,16 +1590,19 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             )
             req_to_token_row[visual_positions] = 0
 
-        slots_to_free = (
-            vis_cache.scratch_slot_allocation
-            if vis_cache.scratch_slot_allocation is not None
-            else vis_cache.visual_slot_indices
-        )
-        token_to_kv_pool_allocator.free(
-            slots_to_free.to(device=self.device, dtype=torch.int64)
-        )
+        active_slots = vis_cache.visual_slot_indices
         vis_cache.visual_slot_indices = None
-        vis_cache.scratch_slot_allocation = None
+        if free_allocation:
+            slots_to_free = (
+                vis_cache.scratch_slot_allocation
+                if vis_cache.scratch_slot_allocation is not None
+                else active_slots
+            )
+            if slots_to_free is not None:
+                token_to_kv_pool_allocator.free(
+                    slots_to_free.to(device=self.device, dtype=torch.int64)
+                )
+            vis_cache.scratch_slot_allocation = None
 
     def decompress_all_layers_to_slots(self, req_pool_idx: int):
         """Decompress visual KV across all layers back to slot pool.

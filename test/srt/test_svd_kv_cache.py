@@ -378,7 +378,7 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
         self.assertTrue(torch.equal(vis_cache.visual_token_positions, visual_positions))
 
     def test_activate_and_deactivate_visual_scratch(self):
-        """Decode scratch slots should be temporary and restore row placeholders."""
+        """Decode scratch mappings should be temporary even if backing storage persists."""
         from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 
         pool = self._make_pool()
@@ -418,6 +418,7 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
 
         self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
         self.assertIsNone(vis_cache.visual_slot_indices)
+        self.assertIsNotNone(vis_cache.scratch_slot_allocation)
 
     def test_activate_visual_scratch_returns_none_when_allocator_oom(self):
         """Scratch activation should fail cleanly without mutating request state."""
@@ -502,8 +503,103 @@ class TestFinalVisualSlotResolution(unittest.TestCase):
             token_to_kv_pool_allocator=allocator,
         )
 
-        self.assertIsNone(vis_cache.scratch_slot_allocation)
+        self.assertIsNotNone(vis_cache.scratch_slot_allocation)
         self.assertTrue(torch.equal(req_to_token_row, torch.tensor([20, 0, 21, 0], dtype=torch.int32)))
+
+    def test_activate_visual_scratch_reuses_persistent_allocation(self):
+        """Released visual requests should reuse the same scratch backing across decode steps."""
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+        pool = self._make_pool()
+        allocator = TokenToKVPoolAllocator(
+            size=32,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        req_pool_idx = 0
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 0, 21, 0], dtype=torch.int32)
+        final_slots = torch.tensor([5, 9], dtype=torch.int64)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        vis_cache.visual_token_positions = visual_positions.clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.released_dense_visual_slots = True
+
+        available_before = allocator.available_size()
+        scratch_first = pool.activate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+        allocation_first = vis_cache.scratch_slot_allocation.clone()
+        available_after_first = allocator.available_size()
+        pool.deactivate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        scratch_second = pool.activate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+        self.assertTrue(torch.equal(scratch_first, scratch_second))
+        self.assertTrue(torch.equal(allocation_first, vis_cache.scratch_slot_allocation))
+        self.assertEqual(available_after_first, allocator.available_size())
+        self.assertLess(available_after_first, available_before)
+
+    def test_free_visual_cache_releases_persistent_scratch(self):
+        """Request teardown should free persistent scratch backing storage."""
+        from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
+        pool = self._make_pool(size=64, head_num=4, head_dim=8, rank_k=4, rank_v=4)
+        pool.page_size = 4
+        allocator = PagedTokenToKVPoolAllocator(
+            size=64,
+            page_size=4,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        req_pool_idx = 0
+        visual_positions = torch.tensor([1, 3], dtype=torch.int64)
+        req_to_token_row = torch.tensor([20, 0, 21, 0], dtype=torch.int32)
+        final_slots = torch.tensor([8, 9], dtype=torch.int64)
+
+        pool.compress_all_layers(req_pool_idx=req_pool_idx, visual_slot_indices=final_slots)
+        vis_cache = pool.get_visual_cache(req_pool_idx)
+        vis_cache.visual_token_positions = visual_positions.clone()
+        vis_cache.visual_slot_indices = None
+        vis_cache.released_dense_visual_slots = True
+
+        available_before = allocator.available_size()
+        pool.activate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+        available_after_activate = allocator.available_size()
+        pool.deactivate_visual_scratch(
+            req_pool_idx=req_pool_idx,
+            req_to_token_row=req_to_token_row,
+            token_to_kv_pool_allocator=allocator,
+        )
+        pool.free_visual_cache(
+            req_pool_idx, token_to_kv_pool_allocator=allocator
+        )
+
+        self.assertLess(available_after_activate, available_before)
+        self.assertEqual(allocator.available_size(), available_before)
+        self.assertIsNone(pool.get_visual_cache(req_pool_idx))
 
     def test_compression_stats_report_released_and_scratch_state(self):
         """Compression stats should surface released/scratch state for debugging."""
@@ -714,13 +810,22 @@ class TestSVDDecodeScratchBudget(unittest.TestCase):
 
         caches = {
             0: SimpleNamespace(
-                is_compressed=True, released_dense_visual_slots=True, num_tokens=3
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                num_tokens=3,
+                scratch_slot_allocation=None,
             ),
             1: SimpleNamespace(
-                is_compressed=True, released_dense_visual_slots=False, num_tokens=7
+                is_compressed=True,
+                released_dense_visual_slots=False,
+                num_tokens=7,
+                scratch_slot_allocation=None,
             ),
             2: SimpleNamespace(
-                is_compressed=False, released_dense_visual_slots=True, num_tokens=9
+                is_compressed=False,
+                released_dense_visual_slots=True,
+                num_tokens=9,
+                scratch_slot_allocation=None,
             ),
         }
         allocator = self._FakeAllocator(
@@ -741,13 +846,38 @@ class TestSVDDecodeScratchBudget(unittest.TestCase):
             4,
         )
 
+    def test_visual_scratch_tokens_required_next_decode_skips_persistent_scratch(self):
+        self._enable_svd_args(page_size=4)
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        caches = {
+            0: SimpleNamespace(
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                num_tokens=3,
+                scratch_slot_allocation=torch.tensor([8, 9, 10, 11], dtype=torch.int64),
+            ),
+        }
+        allocator = self._FakeAllocator(
+            available_size=64, page_size=4, kv_pool=self._FakeKVPool(caches)
+        )
+        batch = self._make_batch([self._DummyReq(0)], allocator)
+
+        self.assertEqual(
+            ScheduleBatch.visual_scratch_tokens_required_next_decode(batch),
+            0,
+        )
+
     def test_check_decode_mem_accounts_for_visual_scratch(self):
         self._enable_svd_args(page_size=4)
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
         caches = {
             0: SimpleNamespace(
-                is_compressed=True, released_dense_visual_slots=True, num_tokens=3
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                num_tokens=3,
+                scratch_slot_allocation=None,
             ),
         }
         allocator = self._FakeAllocator(
@@ -768,10 +898,16 @@ class TestSVDDecodeScratchBudget(unittest.TestCase):
 
         caches = {
             0: SimpleNamespace(
-                is_compressed=True, released_dense_visual_slots=True, num_tokens=5
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                num_tokens=5,
+                scratch_slot_allocation=None,
             ),
             1: SimpleNamespace(
-                is_compressed=True, released_dense_visual_slots=True, num_tokens=5
+                is_compressed=True,
+                released_dense_visual_slots=True,
+                num_tokens=5,
+                scratch_slot_allocation=None,
             ),
         }
         allocator = self._FakeAllocator(
@@ -933,6 +1069,7 @@ class TestSVDDecodeScratchLifecycle(unittest.TestCase):
                 is_compressed=True,
                 released_dense_visual_slots=True,
                 visual_slot_indices=None,
+                scratch_slot_allocation=None,
                 visual_token_positions=torch.tensor([1, 3], dtype=torch.int64),
                 num_tokens=2,
             ),
@@ -940,6 +1077,7 @@ class TestSVDDecodeScratchLifecycle(unittest.TestCase):
                 is_compressed=True,
                 released_dense_visual_slots=True,
                 visual_slot_indices=None,
+                scratch_slot_allocation=None,
                 visual_token_positions=torch.tensor([0, 2], dtype=torch.int64),
                 num_tokens=2,
             ),
@@ -977,6 +1115,7 @@ class TestSVDDecodeScratchLifecycle(unittest.TestCase):
         kv_pool.deactivate_visual_scratch.assert_called_once()
         _, deactivate_kwargs = kv_pool.deactivate_visual_scratch.call_args
         self.assertEqual(deactivate_kwargs["req_pool_idx"], 0)
+        self.assertTrue(deactivate_kwargs["free_allocation"])
         self.assertTrue(
             torch.equal(
                 deactivate_kwargs["req_to_token_row"],

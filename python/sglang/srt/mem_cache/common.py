@@ -484,7 +484,9 @@ def _free_svd_visual_cache(tree_cache: BasePrefixCache, req_pool_idx):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolSVD
     kv_pool = get_kvcache()
     if isinstance(kv_pool, MHATokenToKVPoolSVD):
-        kv_pool.free_visual_cache(req_pool_idx)
+        kv_pool.free_visual_cache(
+            req_pool_idx, token_to_kv_pool_allocator=allocator
+        )
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
