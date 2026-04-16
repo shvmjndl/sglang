@@ -140,6 +140,15 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
+    def _set_active_kv_indices(self, forward_batch: ForwardBatch):
+        """Set active KV indices for TurboQuant selective dequantization."""
+        kv_pool = forward_batch.token_to_kv_pool
+        if not hasattr(kv_pool, "set_active_kv_indices"):
+            return
+        kv_indices = self.forward_metadata.kv_indices
+        if kv_indices is not None and kv_indices.numel() > 0:
+            kv_pool.set_active_kv_indices(kv_indices)
+
         # Check arguments
         assert not (
             model_runner.sliding_window_size is not None
@@ -880,6 +889,7 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        self._set_active_kv_indices(forward_batch)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -1010,6 +1020,7 @@ class TritonAttnBackend(AttentionBackend):
             v_descale = 1.0
 
         # Call unified kernel
+        self._set_active_kv_indices(forward_batch)
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
@@ -1089,6 +1100,7 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        self._set_active_kv_indices(forward_batch)
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
