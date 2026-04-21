@@ -70,6 +70,9 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_SVD_EXACT_SMALL_MATRIX_DIM = 128
+_SVD_EXACT_RANK_FRACTION = 0.75
+_SVD_LOWRANK_OVERSAMPLING = 8
 
 
 def _get_index_buf_accessor():
@@ -1238,6 +1241,48 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
     def get_visual_cache(self, req_pool_idx: int) -> Optional[PerRequestVisualCache]:
         return self.visual_caches.get(int(req_pool_idx))
 
+    @staticmethod
+    def _should_use_exact_svd(
+        num_rows: int, num_cols: int, target_rank: int
+    ) -> bool:
+        min_dim = min(num_rows, num_cols)
+        if min_dim <= _SVD_EXACT_SMALL_MATRIX_DIM:
+            return True
+        return target_rank >= int(min_dim * _SVD_EXACT_RANK_FRACTION)
+
+    def _factorize_visual_matrix(
+        self, matrix: torch.Tensor, target_rank: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_rows, num_cols = matrix.shape
+        min_dim = min(num_rows, num_cols)
+
+        if target_rank <= 0:
+            return (
+                torch.empty(
+                    (num_rows, 0), dtype=self.dtype, device=self.device
+                ),
+                torch.empty(
+                    (0, num_cols), dtype=self.dtype, device=self.device
+                ),
+            )
+
+        if self._should_use_exact_svd(num_rows, num_cols, target_rank):
+            U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+            U = U[:, :target_rank]
+            S = S[:target_rank]
+            Vh = Vh[:target_rank, :]
+        else:
+            oversampled_rank = min(
+                min_dim,
+                target_rank + min(_SVD_LOWRANK_OVERSAMPLING, min_dim - target_rank),
+            )
+            U, S, V = torch.svd_lowrank(matrix, q=oversampled_rank)
+            U = U[:, :target_rank]
+            S = S[:target_rank]
+            Vh = V[:, :target_rank].transpose(0, 1)
+
+        return (U * S.unsqueeze(0)).to(self.dtype), Vh.to(self.dtype)
+
     def resolve_visual_slots(
         self,
         req_to_token_row: torch.Tensor,
@@ -1273,11 +1318,48 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             .clone()
         )
 
+    def _visual_slots_are_page_exclusive(
+        self,
+        req_to_token_row: torch.Tensor,
+        visual_positions: torch.Tensor,
+        visual_slot_indices: torch.Tensor,
+        page_size: int,
+    ) -> bool:
+        """Return whether every touched KV page is referenced only by visual tokens."""
+        if page_size <= 1:
+            return True
+
+        live_slots = req_to_token_row.to(device=req_to_token_row.device, dtype=torch.int64)
+        live_slot_mask = live_slots > 0
+        if not torch.any(live_slot_mask):
+            return True
+
+        visual_mask = torch.zeros(
+            req_to_token_row.shape[0], dtype=torch.bool, device=req_to_token_row.device
+        )
+        visual_mask[visual_positions] = True
+
+        touched_pages = torch.unique(
+            visual_slot_indices.to(device=req_to_token_row.device, dtype=torch.int64)
+            // page_size
+        )
+        live_pages = live_slots // page_size
+        for page_idx in touched_pages:
+            page_positions = torch.nonzero(
+                live_slot_mask & (live_pages == page_idx), as_tuple=True
+            )[0]
+            if page_positions.numel() == 0:
+                continue
+            if not torch.all(visual_mask[page_positions]):
+                return False
+        return True
+
     def compress_visual_tokens(
         self,
         layer_id: int,
         req_pool_idx: int,
         visual_slot_indices: torch.Tensor,
+        mark_compressed: bool = True,
     ):
         """Apply multi-head SVD compression to visual token KV vectors.
 
@@ -1314,13 +1396,8 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         rank_k = min(self.rank_k, T_v, self.HD)
         rank_v = min(self.rank_v, T_v, self.v_HD)
 
-        U_k, S_k, V_k = torch.svd_lowrank(k_float, q=rank_k)
-        K_bar = (U_k * S_k.unsqueeze(0)).to(self.dtype)  # [T_v, rank_k]
-        D_k = V_k.T.to(self.dtype)  # [rank_k, HD]
-
-        U_v, S_v, V_v = torch.svd_lowrank(v_float, q=rank_v)
-        V_bar = (U_v * S_v.unsqueeze(0)).to(self.dtype)  # [T_v, rank_v]
-        D_v = V_v.T.to(self.dtype)  # [rank_v, v_HD]
+        K_bar, D_k = self._factorize_visual_matrix(k_float, rank_k)
+        V_bar, D_v = self._factorize_visual_matrix(v_float, rank_v)
 
         # Store in per-request cache
         vis_cache.k_compressed[l] = K_bar
@@ -1331,7 +1408,8 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
             T_v, dtype=torch.float32, device=self.device
         )
         vis_cache.visual_slot_indices = visual_slot_indices.clone()
-        vis_cache.is_compressed = True
+        if mark_compressed:
+            vis_cache.is_compressed = True
 
     def decompress_kv(
         self,
@@ -1477,8 +1555,19 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         )
         vis_cache.visual_slot_indices = visual_slot_indices.clone()
 
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
-            self.compress_visual_tokens(layer_id, req_pool_idx, visual_slot_indices)
+        try:
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+                self.compress_visual_tokens(
+                    layer_id,
+                    req_pool_idx,
+                    visual_slot_indices,
+                    mark_compressed=False,
+                )
+        except Exception:
+            self.free_visual_cache(req_pool_idx)
+            raise
+
+        vis_cache.is_compressed = True
 
     def release_visual_slots_after_prefill(
         self,
@@ -1486,39 +1575,49 @@ class MHATokenToKVPoolSVD(MHATokenToKVPool):
         req_to_token_row: torch.Tensor,
         visual_token_positions: torch.Tensor,
         token_to_kv_pool_allocator,
-    ):
-        """Release long-lived dense visual slots after prefill compression.
-
-        The compressed cache becomes the source of truth. Dense visual slots are
-        removed from the request row and returned to the allocator. Decode can
-        temporarily materialize them later using scratch slots.
-        """
+    ) -> bool:
+        """Release dense visual slots only when their pages are not shared."""
         vis_cache = self.visual_caches.get(int(req_pool_idx))
         if vis_cache is None or not vis_cache.is_compressed:
-            return
+            return False
         if vis_cache.visual_slot_indices is None or len(vis_cache.visual_slot_indices) == 0:
-            return
+            return False
 
         visual_positions = visual_token_positions.to(
             device=req_to_token_row.device, dtype=torch.int64
         )
         visual_positions = visual_positions[visual_positions < req_to_token_row.shape[0]]
         if len(visual_positions) == 0:
-            return
+            return False
 
         slots_to_free = vis_cache.visual_slot_indices.to(
             device=self.device, dtype=torch.int64
         ).clone()
+        vis_cache.visual_token_positions = visual_positions.to(
+            device=self.device, dtype=torch.int64
+        ).clone()
+
+        page_size = max(getattr(token_to_kv_pool_allocator, "page_size", self.page_size), 1)
+        if not self._visual_slots_are_page_exclusive(
+            req_to_token_row=req_to_token_row,
+            visual_positions=visual_positions,
+            visual_slot_indices=slots_to_free,
+            page_size=page_size,
+        ):
+            logger.debug(
+                "Skipping dense visual KV release for req_pool_idx=%s because the "
+                "visual span shares at least one page with live non-visual tokens.",
+                req_pool_idx,
+            )
+            return False
 
         req_to_token_row[visual_positions] = 0
         token_to_kv_pool_allocator.free(slots_to_free)
 
-        vis_cache.visual_token_positions = visual_positions.to(
-            device=self.device, dtype=torch.int64
-        ).clone()
         vis_cache.visual_slot_indices = None
         vis_cache.scratch_slot_allocation = None
         vis_cache.released_dense_visual_slots = True
+        return True
 
     def activate_visual_scratch(
         self,

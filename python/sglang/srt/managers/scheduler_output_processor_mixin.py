@@ -170,18 +170,21 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
+                    is_decode_req_in_mixed_batch = (
+                        batch.decoding_reqs is not None and req in batch.decoding_reqs
+                    )
+
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif not is_decode_req_in_mixed_batch:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    if not req.finished():
-                        # Run compression only after prefix-cache finalization so
-                        # visual slots reflect the request's current shared mapping.
+                    if not req.finished() and not is_decode_req_in_mixed_batch:
+                        # Mixed-batch decode requests already finalized prefill earlier.
                         self._svd_compress_after_prefill(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
@@ -1239,6 +1242,11 @@ class SchedulerOutputProcessorMixin:
         if visual_positions is None or len(visual_positions) == 0:
             return
 
+        vis_cache = kv_pool.get_visual_cache(req.req_pool_idx)
+        if vis_cache is not None and vis_cache.is_compressed:
+            # Prefill finalization should run at most once per request.
+            return
+
         prompt_len = len(req.origin_input_ids)
         req_to_token_row = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prompt_len
@@ -1251,11 +1259,6 @@ class SchedulerOutputProcessorMixin:
         if visual_slots is None or len(visual_slots) == 0:
             return
 
-        # Compression is synchronous (blocks until SVD completes on GPU).
-        # This is intentional: the scheduler loop is sequential, so compression
-        # must finish before get_next_batch_to_run() can schedule this request
-        # for decode. A future optimization could use async compression with a
-        # "compression pending" flag to avoid blocking the scheduler hot path.
         kv_pool.compress_all_layers(req.req_pool_idx, visual_slots)
         kv_pool.release_visual_slots_after_prefill(
             req_pool_idx=req.req_pool_idx,
