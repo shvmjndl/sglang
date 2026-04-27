@@ -62,6 +62,9 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Token-level page table (before conversion to page indices).
+    # Used by TurboQuant to identify active KV positions for selective dequant.
+    token_page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
 
@@ -402,6 +405,43 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
+    def _set_active_kv_indices(self, forward_batch: ForwardBatch):
+        """Set active KV indices for TurboQuant selective dequantization.
+
+        Computes the token positions that will be read by the attention kernel
+        from the req_to_token table and seq_lens, and passes them to the KV pool
+        so it knows which positions to dequantize. This is needed for backends
+        that don't use FlashInfer's kv_indices mechanism (e.g. FA3, triton).
+        """
+        kv_pool = forward_batch.token_to_kv_pool
+        if not hasattr(kv_pool, "set_active_kv_indices"):
+            return
+
+        seq_lens = forward_batch.seq_lens
+
+        # Fast path: use the pre-built token_page_table (saved before
+        # page table conversion to page indices).
+        metadata = self.forward_metadata
+        if metadata.token_page_table is not None:
+            token_table = metadata.token_page_table
+            max_seq_len = token_table.shape[1]
+        else:
+            # Fallback: reconstruct from req_to_token
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
+            req_pool_indices = forward_batch.req_pool_indices
+            max_seq_len = seq_lens.max().item()
+            token_table = req_to_token[req_pool_indices[:, None], :max_seq_len]
+
+        # Mask positions beyond each sequence's length
+        positions = torch.arange(max_seq_len, device=seq_lens.device)
+        mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)  # (batch, max_seq)
+
+        # Flatten to get active token positions.
+        # Duplicate indices are OK — dequant writes the same data redundantly.
+        active_indices = token_table[mask]
+
+        kv_pool.set_active_kv_indices(active_indices)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -682,6 +722,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             )
 
+        # Save token-level page table before converting to page indices.
+        # Needed for TurboQuant selective dequantization.
+        metadata.token_page_table = metadata.page_table
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -879,6 +923,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
+            self._set_active_kv_indices(forward_batch)
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
@@ -1049,6 +1094,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 assert self.fa_impl_ver in [3], "Only FA3 support here"
                 # Do absorbed multi-latent attention
+                self._set_active_kv_indices(forward_batch)
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
                 ).to(q.dtype)
@@ -1212,6 +1258,7 @@ class FlashAttentionBackend(AttentionBackend):
         if not self.use_mla:
             # Do multi-head attention
 
+            self._set_active_kv_indices(forward_batch)
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
@@ -1332,6 +1379,7 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
+            self._set_active_kv_indices(forward_batch)
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )

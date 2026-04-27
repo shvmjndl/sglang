@@ -29,7 +29,11 @@ import torch
 # ---------------------------------------------------------------------------
 _kernels_path = os.path.join(
     os.path.dirname(__file__),
-    "..", "srt", "layers", "quantization", "turboquant_kernels.py",
+    "..",
+    "srt",
+    "layers",
+    "quantization",
+    "turboquant_kernels.py",
 )
 _spec = importlib.util.spec_from_file_location(
     "turboquant_kernels", os.path.abspath(_kernels_path)
@@ -50,22 +54,24 @@ DEVICE = torch.device("cuda")
 # Hadamard seeds (must match turboquant_memory_pool.py)
 _SEED_K, _SEED_K_LO, _SEED_V, _SEED_V_LO = 42, 43, 137, 138
 
-rotate_matrix_S=torch.randn(128,128)
 # ---------------------------------------------------------------------------
 # TurboQuant helpers (reused from existing test)
 # ---------------------------------------------------------------------------
+
 
 def _make_hadamard_set(hd, bits):
     is_mixed, bh, bl = parse_bits(bits)
     if is_mixed:
         split = hd // 2
         return {
-            "k_h": None, "v_h": None,
+            "k_h": None,
+            "v_h": None,
             "k_hi": HadamardTransform(split, seed=_SEED_K, device=DEVICE),
             "k_lo": HadamardTransform(hd - split, seed=_SEED_K_LO, device=DEVICE),
             "v_hi": HadamardTransform(split, seed=_SEED_V, device=DEVICE),
             "v_lo": HadamardTransform(hd - split, seed=_SEED_V_LO, device=DEVICE),
-            "k_split": split, "v_split": split,
+            "k_split": split,
+            "v_split": split,
         }
     return {
         "k_h": HadamardTransform(hd, seed=_SEED_K, device=DEVICE),
@@ -73,7 +79,7 @@ def _make_hadamard_set(hd, bits):
     }
 
 
-def _quantize_roundtrip(flat, bits, hs, is_key=True,quant_type=None):
+def _quantize_roundtrip(flat, bits, hs, is_key=True, quant_type=None):
     is_mixed, bh, bl = parse_bits(bits)
     if is_mixed:
         hi = hs["k_hi"] if is_key else hs["v_hi"]
@@ -85,7 +91,8 @@ def _quantize_roundtrip(flat, bits, hs, is_key=True,quant_type=None):
     q = turboquant_quantize(flat, h, int(bits), quant_type)
     return turboquant_dequantize(q, h, int(bits), quant_type, torch.bfloat16)
 
-def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64,quant_type=None):
+
+def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64, quant_type=None):
     """
     Batched autoregressive generation with TQ-compressed KV cache.
 
@@ -101,8 +108,8 @@ def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64,quant_type
     from transformers import DynamicCache
 
     hs = _make_hadamard_set(hd, bits)
-    input_ids = inputs["input_ids"]                # (B, S)
-    attention_mask = inputs["attention_mask"]       # (B, S)
+    input_ids = inputs["input_ids"]  # (B, S)
+    attention_mask = inputs["attention_mask"]  # (B, S)
     bs = input_ids.shape[0]
 
     # Track which sequences have finished (hit EOS)
@@ -120,12 +127,20 @@ def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64,quant_type
             k, v = lkv[0], lkv[1]  # (B, H, S, D)
             b, h, s, dk = k.shape
             dv = v.shape[-1]
-            kr = _quantize_roundtrip(
-                k.permute(0, 2, 1, 3).reshape(-1, dk), bits, hs, True,quant_type
-            )[:, :dk].reshape(b, s, h, dk).permute(0, 2, 1, 3)
-            vr = _quantize_roundtrip(
-                v.permute(0, 2, 1, 3).reshape(-1, dv), bits, hs, False,quant_type
-            )[:, :dv].reshape(b, s, h, dv).permute(0, 2, 1, 3)
+            kr = (
+                _quantize_roundtrip(
+                    k.permute(0, 2, 1, 3).reshape(-1, dk), bits, hs, True, quant_type
+                )[:, :dk]
+                .reshape(b, s, h, dk)
+                .permute(0, 2, 1, 3)
+            )
+            vr = (
+                _quantize_roundtrip(
+                    v.permute(0, 2, 1, 3).reshape(-1, dv), bits, hs, False, quant_type
+                )[:, :dv]
+                .reshape(b, s, h, dv)
+                .permute(0, 2, 1, 3)
+            )
             tql.append((kr, vr))
 
         tc = DynamicCache()
@@ -138,7 +153,10 @@ def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64,quant_type
 
         # Update attention mask for the new token
         cur_mask = torch.cat(
-            [attention_mask, torch.ones(bs, 1, dtype=attention_mask.dtype, device=DEVICE)],
+            [
+                attention_mask,
+                torch.ones(bs, 1, dtype=attention_mask.dtype, device=DEVICE),
+            ],
             dim=1,
         )
 
@@ -165,21 +183,39 @@ def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64,quant_type
             # Quantize only the newly appended KV token
             nl = []
             for lkv in tc:
-                kf, vf = lkv[0], lkv[1]            # (B, H, S_total, D)
-                kn = kf[:, :, -1:, :]               # (B, H, 1, D)
+                kf, vf = lkv[0], lkv[1]  # (B, H, S_total, D)
+                kn = kf[:, :, -1:, :]  # (B, H, 1, D)
                 vn = vf[:, :, -1:, :]
                 b2, h2, _, dk2 = kn.shape
                 dv2 = vn.shape[-1]
-                kr2 = _quantize_roundtrip(
-                    kn.permute(0, 2, 1, 3).reshape(-1, dk2), bits, hs, True,quant_type
-                )[:, :dk2].reshape(b2, 1, h2, dk2).permute(0, 2, 1, 3)
-                vr2 = _quantize_roundtrip(
-                    vn.permute(0, 2, 1, 3).reshape(-1, dv2), bits, hs, False,quant_type
-                )[:, :dv2].reshape(b2, 1, h2, dv2).permute(0, 2, 1, 3)
-                nl.append((
-                    torch.cat([kf[:, :, :-1, :], kr2], dim=2),
-                    torch.cat([vf[:, :, :-1, :], vr2], dim=2),
-                ))
+                kr2 = (
+                    _quantize_roundtrip(
+                        kn.permute(0, 2, 1, 3).reshape(-1, dk2),
+                        bits,
+                        hs,
+                        True,
+                        quant_type,
+                    )[:, :dk2]
+                    .reshape(b2, 1, h2, dk2)
+                    .permute(0, 2, 1, 3)
+                )
+                vr2 = (
+                    _quantize_roundtrip(
+                        vn.permute(0, 2, 1, 3).reshape(-1, dv2),
+                        bits,
+                        hs,
+                        False,
+                        quant_type,
+                    )[:, :dv2]
+                    .reshape(b2, 1, h2, dv2)
+                    .permute(0, 2, 1, 3)
+                )
+                nl.append(
+                    (
+                        torch.cat([kf[:, :, :-1, :], kr2], dim=2),
+                        torch.cat([vf[:, :, :-1, :], vr2], dim=2),
+                    )
+                )
 
             tc = DynamicCache()
             for li, (kt, vt) in enumerate(nl):
@@ -203,9 +239,11 @@ def _tq_generate_batch(model, tokenizer, inputs, bits, hd, max_new=64,quant_type
 
     return gen_ids
 
+
 def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=64):
     """Autoregressive generation with TQ-compressed KV cache."""
     from transformers import DynamicCache
+
     hs = _make_hadamard_set(hd, bits)
 
     with torch.no_grad():
@@ -215,12 +253,20 @@ def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=64):
             k, v = lkv[0], lkv[1]
             b, h, s, dk = k.shape
             dv = v.shape[-1]
-            kr = _quantize_roundtrip(
-                k.permute(0, 2, 1, 3).reshape(-1, dk), bits, hs, True
-            )[:, :dk].reshape(b, s, h, dk).permute(0, 2, 1, 3)
-            vr = _quantize_roundtrip(
-                v.permute(0, 2, 1, 3).reshape(-1, dv), bits, hs, False
-            )[:, :dv].reshape(b, s, h, dv).permute(0, 2, 1, 3)
+            kr = (
+                _quantize_roundtrip(
+                    k.permute(0, 2, 1, 3).reshape(-1, dk), bits, hs, True
+                )[:, :dk]
+                .reshape(b, s, h, dk)
+                .permute(0, 2, 1, 3)
+            )
+            vr = (
+                _quantize_roundtrip(
+                    v.permute(0, 2, 1, 3).reshape(-1, dv), bits, hs, False
+                )[:, :dv]
+                .reshape(b, s, h, dv)
+                .permute(0, 2, 1, 3)
+            )
             tql.append((kr, vr))
 
         tc = DynamicCache()
@@ -239,16 +285,26 @@ def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=64):
                 kn, vn = kf[:, :, -1:, :], vf[:, :, -1:, :]
                 b2, h2, _, dk2 = kn.shape
                 dv2 = vn.shape[-1]
-                kr2 = _quantize_roundtrip(
-                    kn.permute(0, 2, 1, 3).reshape(-1, dk2), bits, hs, True
-                )[:, :dk2].reshape(b2, 1, h2, dk2).permute(0, 2, 1, 3)
-                vr2 = _quantize_roundtrip(
-                    vn.permute(0, 2, 1, 3).reshape(-1, dv2), bits, hs, False
-                )[:, :dv2].reshape(b2, 1, h2, dv2).permute(0, 2, 1, 3)
-                nl.append((
-                    torch.cat([kf[:, :, :-1, :], kr2], dim=2),
-                    torch.cat([vf[:, :, :-1, :], vr2], dim=2),
-                ))
+                kr2 = (
+                    _quantize_roundtrip(
+                        kn.permute(0, 2, 1, 3).reshape(-1, dk2), bits, hs, True
+                    )[:, :dk2]
+                    .reshape(b2, 1, h2, dk2)
+                    .permute(0, 2, 1, 3)
+                )
+                vr2 = (
+                    _quantize_roundtrip(
+                        vn.permute(0, 2, 1, 3).reshape(-1, dv2), bits, hs, False
+                    )[:, :dv2]
+                    .reshape(b2, 1, h2, dv2)
+                    .permute(0, 2, 1, 3)
+                )
+                nl.append(
+                    (
+                        torch.cat([kf[:, :, :-1, :], kr2], dim=2),
+                        torch.cat([vf[:, :, :-1, :], vr2], dim=2),
+                    )
+                )
             tc = DynamicCache()
             for li, (kt, vt) in enumerate(nl):
                 tc.update(kt.contiguous(), vt.contiguous(), li)
@@ -263,15 +319,16 @@ def _tq_generate(model, tokenizer, inputs, bits, hd, max_new=64):
 # GPQA dataset loading
 # ---------------------------------------------------------------------------
 
+
 def load_gpqa_dataset(split="train", max_samples=None, shard=None):
     """
     Load GPQA Diamond from HuggingFace datasets.
- 
+
     Args:
         split: dataset split
         max_samples: cap total samples before sharding
         shard: if set (1-4), return only that quarter of the dataset
- 
+
     Each sample has:
       - question (str)
       - choices: list of 4 answer strings
@@ -280,14 +337,14 @@ def load_gpqa_dataset(split="train", max_samples=None, shard=None):
     from datasets import load_dataset
     import hashlib
     import random as _random
- 
+
     ds = load_dataset("Idavidrein/gpqa", "gpqa_diamond", split=split)
- 
+
     samples = []
     for i, row in enumerate(ds):
         if max_samples and i >= max_samples:
             break
- 
+
         # GPQA Diamond fields:
         #   "Question", "Correct Answer", "Incorrect Answer 1/2/3"
         question = row["Question"]
@@ -297,7 +354,7 @@ def load_gpqa_dataset(split="train", max_samples=None, shard=None):
             row["Incorrect Answer 2"],
             row["Incorrect Answer 3"],
         ]
- 
+
         # Deterministic shuffle: place correct answer at a fixed position
         # based on hash to avoid position bias but keep reproducibility
         choices = incorrects + [correct]
@@ -305,13 +362,15 @@ def load_gpqa_dataset(split="train", max_samples=None, shard=None):
         rng = _random.Random(seed)
         rng.shuffle(choices)
         answer_index = choices.index(correct)
- 
-        samples.append({
-            "question": question,
-            "choices": choices,
-            "answer_index": answer_index,
-        })
- 
+
+        samples.append(
+            {
+                "question": question,
+                "choices": choices,
+                "answer_index": answer_index,
+            }
+        )
+
     # Apply sharding: split into 4 equal parts, return the requested quarter
     if shard is not None:
         assert 1 <= shard <= 4, f"shard must be 1-4, got {shard}"
@@ -320,7 +379,7 @@ def load_gpqa_dataset(split="train", max_samples=None, shard=None):
         start = (shard - 1) * shard_size
         end = min(shard * shard_size, total)
         samples = samples[start:end]
- 
+
     return samples
 
 
@@ -341,15 +400,14 @@ D) {D}
 CHOICE_LABELS = ["A", "B", "C", "D"]
 
 
-
 def format_question_block(sample):
     """Format the question + choices block."""
     prompt = QUERY_TEMPLATE_MULTICHOICE.format(
-        Question=sample['question'],
+        Question=sample["question"],
         A=sample["choices"][0],
         B=sample["choices"][1],
         C=sample["choices"][2],
-        D=sample["choices"][3]
+        D=sample["choices"][3],
     )
 
     return prompt
@@ -362,9 +420,8 @@ def extract_answer(generated_text):
     """
     text = generated_text.strip()
 
-
     # Try to find any letter in the text
-    answer_pattern=r"(?i)Answer\s*:\s*([A-D])"
+    answer_pattern = r"(?i)Answer\s*:\s*([A-D])"
 
     matches = re.findall(answer_pattern, text)
     extracted_answer = matches[-1].upper() if matches else None
@@ -385,7 +442,7 @@ def evaluate_gpqa(
     max_new_tokens=32768,
     batch_size=8,
     verbose=True,
-    quant_type=None
+    quant_type=None,
 ):
     """
     Evaluate model on GPQA samples with batch processing.
@@ -429,7 +486,7 @@ def evaluate_gpqa(
             messages = [
                 {
                     "role": "user",
-                    "content": format_question_block(s)
+                    "content": format_question_block(s),
                     # + "\nAnswer with the letter A, B, C, or D."
                 },
             ]
@@ -469,17 +526,25 @@ def evaluate_gpqa(
                 if is_correct:
                     correct += 1
                 total += 1
-                results.append({
-                    "index": start + i,
-                    "predicted": predicted,
-                    "expected": expected,
-                    "correct": is_correct,
-                    "generated_text": gen_text.strip()[:100],
-                })
+                results.append(
+                    {
+                        "index": start + i,
+                        "predicted": predicted,
+                        "expected": expected,
+                        "correct": is_correct,
+                        "generated_text": gen_text.strip()[:100],
+                    }
+                )
 
         elif mode == "turboquant":
             batch_gen_ids = _tq_generate_batch(
-                model, tokenizer, inputs, bits, hd, max_new=max_new_tokens,quant_type=quant_type
+                model,
+                tokenizer,
+                inputs,
+                bits,
+                hd,
+                max_new=max_new_tokens,
+                quant_type=quant_type,
             )
             for i in range(cur_bs):
                 gen_ids = batch_gen_ids[i]
@@ -492,13 +557,15 @@ def evaluate_gpqa(
                 if is_correct:
                     correct += 1
                 total += 1
-                results.append({
-                    "index": start + i,
-                    "predicted": predicted,
-                    "expected": expected,
-                    "correct": is_correct,
-                    "generated_text": gen_text.strip()[:100],
-                })
+                results.append(
+                    {
+                        "index": start + i,
+                        "predicted": predicted,
+                        "expected": expected,
+                        "correct": is_correct,
+                        "generated_text": gen_text.strip()[:100],
+                    }
+                )
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -528,17 +595,13 @@ def evaluate_gpqa(
     }
 
 
-
 # ---------------------------------------------------------------------------
 # Main test function
 # ---------------------------------------------------------------------------
 
+
 def test_gpqa_qwen3_8b(
-    bits_list=None,
-    max_samples=None,
-    modes=None,
-    shard=None,
-    quant_type=None
+    bits_list=None, max_samples=None, modes=None, shard=None, quant_type=None
 ):
     """
     Run GPQA Diamond benchmark on Qwen3-8B with baseline and TurboQuant.
@@ -566,7 +629,7 @@ def test_gpqa_qwen3_8b(
 
     # --- Load dataset ---
     print(f"Loading GPQA Diamond dataset... shard {shard}")
-    samples = load_gpqa_dataset(split="train", max_samples=max_samples,shard=shard)
+    samples = load_gpqa_dataset(split="train", max_samples=max_samples, shard=shard)
     print(f"  Loaded {len(samples)} samples\n")
 
     # --- Load model ---
@@ -579,7 +642,9 @@ def test_gpqa_qwen3_8b(
 
     cfg = model.config
     hd = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
-    print(f"  Config: {cfg.num_hidden_layers}L, {cfg.num_key_value_heads} KV heads, head_dim={hd}")
+    print(
+        f"  Config: {cfg.num_hidden_layers}L, {cfg.num_key_value_heads} KV heads, head_dim={hd}"
+    )
     print(f"  Compression ratios: ", end="")
     for b in bits_list:
         print(f"{b}b={compute_compression_ratio(hd, b):.2f}x  ", end="")
@@ -590,11 +655,13 @@ def test_gpqa_qwen3_8b(
     inp0 = tokenizer(samples[0]["question"][:200], return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         o = model(**inp0, use_cache=True)
-        ak = torch.cat([
-            torch.norm(l[0].float().reshape(-1, l[0].shape[-1]), dim=-1)
-            for l in o.past_key_values
-        ])
-    amp = ak.mean().item() / hd ** 0.5
+        ak = torch.cat(
+            [
+                torch.norm(l[0].float().reshape(-1, l[0].shape[-1]), dim=-1)
+                for l in o.past_key_values
+            ]
+        )
+    amp = ak.mean().item() / hd**0.5
     print(f"  K-norm amplification: {amp:.2f}x\n")
     del o, ak
     torch.cuda.empty_cache()
@@ -608,13 +675,19 @@ def test_gpqa_qwen3_8b(
         print(f"Running BASELINE (bf16) evaluation...")
         print(f"{'─'*50}")
         baseline_result = evaluate_gpqa(
-            model, tokenizer, samples,
-            mode="baseline", hd=hd, verbose=True,
+            model,
+            tokenizer,
+            samples,
+            mode="baseline",
+            hd=hd,
+            verbose=True,
         )
         all_eval_results["bf16"] = baseline_result
-        print(f"  BASELINE accuracy: {baseline_result['accuracy']:.1%} "
-              f"({baseline_result['correct']}/{baseline_result['total']}) "
-              f"in {baseline_result['elapsed_s']:.1f}s\n")
+        print(
+            f"  BASELINE accuracy: {baseline_result['accuracy']:.1%} "
+            f"({baseline_result['correct']}/{baseline_result['total']}) "
+            f"in {baseline_result['elapsed_s']:.1f}s\n"
+        )
 
     # TurboQuant at each bit-width
     if "turboquant" in modes:
@@ -624,19 +697,29 @@ def test_gpqa_qwen3_8b(
             print(f"Running TURBOQUANT {bits}b ({cr:.2f}x compression) evaluation...")
             print(f"{'─'*50}")
             tq_result = evaluate_gpqa(
-                model, tokenizer, samples,
-                mode="turboquant", bits=bits, hd=hd, verbose=True,quant_type=quant_type
+                model,
+                tokenizer,
+                samples,
+                mode="turboquant",
+                bits=bits,
+                hd=hd,
+                verbose=True,
+                quant_type=quant_type,
             )
             all_eval_results[f"tq_{bits}b"] = tq_result
-            print(f"  TQ-{bits}b accuracy: {tq_result['accuracy']:.1%} "
-                  f"({tq_result['correct']}/{tq_result['total']}) "
-                  f"in {tq_result['elapsed_s']:.1f}s\n")
+            print(
+                f"  TQ-{bits}b accuracy: {tq_result['accuracy']:.1%} "
+                f"({tq_result['correct']}/{tq_result['total']}) "
+                f"in {tq_result['elapsed_s']:.1f}s\n"
+            )
 
     # --- Print summary ---
     print(f"\n{'='*70}")
     print(f"GPQA DIAMOND RESULTS SUMMARY: {model_id}")
     print(f"{'='*70}")
-    print(f"  {'Mode':<20s}  {'Accuracy':>10s}  {'Correct':>10s}  {'Time':>8s}  {'Compress':>10s}")
+    print(
+        f"  {'Mode':<20s}  {'Accuracy':>10s}  {'Correct':>10s}  {'Time':>8s}  {'Compress':>10s}"
+    )
     print(f"  {'─'*20}  {'─'*10}  {'─'*10}  {'─'*8}  {'─'*10}")
 
     baseline_acc = None
@@ -651,7 +734,9 @@ def test_gpqa_qwen3_8b(
         else:
             b = res["bits"]
             compress_str = f"{compute_compression_ratio(hd, b):.2f}x"
-        print(f"  {mode_label:<20s}  {acc_str:>10s}  {count_str:>10s}  {time_str:>8s}  {compress_str:>10s}")
+        print(
+            f"  {mode_label:<20s}  {acc_str:>10s}  {count_str:>10s}  {time_str:>8s}  {compress_str:>10s}"
+        )
 
     # Show accuracy delta if both modes ran
     if baseline_acc is not None:
@@ -671,9 +756,9 @@ def test_gpqa_qwen3_8b(
     if "bf16" in all_eval_results:
         bl_acc = all_eval_results["bf16"]["accuracy"]
         # GPQA is hard; even bf16 might not score high, but should be above random (25%)
-        assert bl_acc > 0.25, (
-            f"Baseline accuracy {bl_acc:.1%} is at or below random chance"
-        )
+        assert (
+            bl_acc > 0.25
+        ), f"Baseline accuracy {bl_acc:.1%} is at or below random chance"
 
     for key, res in all_eval_results.items():
         if key == "bf16":
@@ -710,28 +795,43 @@ if __name__ == "__main__":
         description="GPQA Diamond benchmark: Qwen3-8B with TurboQuant"
     )
     parser.add_argument(
-        "--bits", type=float, nargs="+", default=[4],
+        "--bits",
+        type=float,
+        nargs="+",
+        default=[4],
         help="TQ bit-widths to test (e.g. 2.5 3.5 4)",
     )
     parser.add_argument(
-        "--max-samples", type=int, default=None,
+        "--max-samples",
+        type=int,
+        default=None,
         help="Max number of GPQA samples to evaluate",
     )
     parser.add_argument(
-        "--mode", type=str, nargs="+", default=["baseline", "turboquant"],
+        "--mode",
+        type=str,
+        nargs="+",
+        default=["baseline", "turboquant"],
         choices=["baseline", "turboquant"],
         help="Evaluation modes to run",
     )
     parser.add_argument(
-        "--shard", type=int, default=None, choices=[1, 2, 3, 4],
+        "--shard",
+        type=int,
+        default=None,
+        choices=[1, 2, 3, 4],
         help="Run only the Nth quarter of the dataset (1-4). Omit to run all.",
     )
     parser.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="Path to save JSON results",
     )
     parser.add_argument(
-        "--quant_type", type=str, default=["mse"],
+        "--quant_type",
+        type=str,
+        default=["mse"],
         choices=["prod", "mse"],
         help="Quantization type to use",
     )
@@ -745,16 +845,14 @@ if __name__ == "__main__":
         max_samples=args.max_samples,
         modes=args.mode,
         shard=args.shard,
-        quant_type=args.quant_type
+        quant_type=args.quant_type,
     )
 
     if args.output:
         # Save results (strip per-sample details for readability)
         save_data = {}
         for key, res in results.items():
-            save_data[key] = {
-                k: v for k, v in res.items() if k != "results"
-            }
+            save_data[key] = {k: v for k, v in res.items() if k != "results"}
             save_data[key]["per_sample"] = res["results"]
         with open(args.output, "w") as f:
             json.dump(save_data, f, indent=2)

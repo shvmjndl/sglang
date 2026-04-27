@@ -12,7 +12,7 @@ This gives O(active_tokens) reads with real memory savings (~3.76x at 4-bit).
 import math
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -81,10 +81,24 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        skip_layers: Optional[List[int]] = None,
     ):
         self.bits = bits
         self.mode = mode
         self.is_mixed, self.bits_hi, self.bits_lo = parse_bits(bits)
+
+        # Layers (in this pool's local index space, i.e. layer_id - start_layer)
+        # that are NOT TurboQuant-quantized. They use a full-precision KV cache
+        # buffer of dtype `dtype` instead of compressed storage. The user
+        # provides global indices via --turboquant-skip-layers; we translate
+        # them to local indices here once start_layer is known.
+        # The actual translation happens inside _create_buffers because
+        # start_layer is set by super().__init__ below; we just stash the raw
+        # global list for now.
+        self._skip_layers_global: List[int] = (
+            list(skip_layers) if skip_layers else []
+        )
+        self._skip_layers_local: set = set()  # filled in _init_skip_layers
 
         self.padded_head_dim = _next_power_of_2(head_dim)
         effective_v = v_head_dim if v_head_dim is not None else head_dim
@@ -172,9 +186,36 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self._k_scaled_centroids = c / math.sqrt(self.padded_head_dim)
             self._v_scaled_centroids = c / math.sqrt(self.v_padded_head_dim)
 
+    def _init_skip_layers(self):
+        """Translate global skip-layer indices to local (per-pool) indices."""
+        start = self.start_layer if self.start_layer is not None else 0
+        local = set()
+        for g in self._skip_layers_global:
+            li = g - start
+            if 0 <= li < self.layer_num:
+                local.add(li)
+        self._skip_layers_local = local
+
+    def _is_skipped(self, idx: int) -> bool:
+        return idx in self._skip_layers_local
+
+    def is_layer_skipped(self, layer_id: int) -> bool:
+        """Public helper: True iff this layer_id is kept in full precision."""
+        idx = layer_id - (self.start_layer or 0)
+        return self._is_skipped(idx)
+
     def _create_buffers(self):
-        """Allocate compressed storage + shared workspace."""
+        """Allocate compressed storage + shared workspace.
+
+        For layers listed in `skip_layers`, allocate a full-precision KV
+        buffer of shape (m, head_num, head_dim) instead of compressed
+        storage. Compressed entries for those layers are set to ``None``.
+        """
         self.store_dtype = torch.uint8
+
+        # start_layer is set by super().__init__ before _create_buffers is
+        # invoked, so it's safe to translate skip layers here.
+        self._init_skip_layers()
 
         m = self.size + self.page_size
         if self.mode=="mse":
@@ -184,73 +225,93 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             k_packed_dim = compute_packed_dim_mixed(self.head_dim, self.bits-1)
             v_packed_dim = compute_packed_dim_mixed(self.v_head_dim, self.bits-1)
 
+        # Full-precision KV buffers for skipped layers (sparse: only
+        # allocated for indices in self._skip_layers_local).
+        self._k_full_buffer: dict = {}
+        self._v_full_buffer: dict = {}
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # Bit-packed centroid indices — per layer
+                # Bit-packed centroid indices — per layer (None for skipped)
                 self.k_buffer = [
-                    torch.zeros(
+                    None if self._is_skipped(i) else torch.zeros(
                         (m, self.head_num, k_packed_dim),
                         dtype=torch.uint8, device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for i in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    torch.zeros(
+                    None if self._is_skipped(i) else torch.zeros(
                         (m, self.head_num, v_packed_dim),
                         dtype=torch.uint8, device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for i in range(self.layer_num)
                 ]
 
-                # L2 norms — per layer
+                # L2 norms — per layer (None for skipped)
                 norm_shape = (
                     (m, self.head_num, 2) if self.is_mixed else (m, self.head_num)
                 )
                 self.k_norms_buffer = [
-                    torch.zeros(norm_shape, dtype=torch.float32, device=self.device)
-                    for _ in range(self.layer_num)
+                    None if self._is_skipped(i) else torch.zeros(
+                        norm_shape, dtype=torch.float32, device=self.device,
+                    )
+                    for i in range(self.layer_num)
                 ]
                 self.v_norms_buffer = [
-                    torch.zeros(norm_shape, dtype=torch.float32, device=self.device)
-                    for _ in range(self.layer_num)
+                    None if self._is_skipped(i) else torch.zeros(
+                        norm_shape, dtype=torch.float32, device=self.device,
+                    )
+                    for i in range(self.layer_num)
                 ]
 
-                # QJL — only for "prod" mode
+                # QJL — only for "prod" mode (None for skipped)
                 if self.mode == "prod":
                     k_qjl_dim = compute_packed_dim(self.padded_head_dim, 1)
                     v_qjl_dim = compute_packed_dim(self.v_padded_head_dim, 1)
                     self.k_qjl_buffer = [
-                        torch.zeros(
+                        None if self._is_skipped(i) else torch.zeros(
                             (m, self.head_num, k_qjl_dim),
                             dtype=torch.uint8, device=self.device,
                         )
-                        for _ in range(self.layer_num)
+                        for i in range(self.layer_num)
                     ]
                     self.v_qjl_buffer = [
-                        torch.zeros(
+                        None if self._is_skipped(i) else torch.zeros(
                             (m, self.head_num, v_qjl_dim),
                             dtype=torch.uint8, device=self.device,
                         )
-                        for _ in range(self.layer_num)
+                        for i in range(self.layer_num)
                     ]
                     self.k_residual_norms_buffer = [
-                        torch.zeros(
+                        None if self._is_skipped(i) else torch.zeros(
                             (m, self.head_num),
                             dtype=torch.float32, device=self.device,
                         )
-                        for _ in range(self.layer_num)
+                        for i in range(self.layer_num)
                     ]
                     self.v_residual_norms_buffer = [
-                        torch.zeros(
+                        None if self._is_skipped(i) else torch.zeros(
                             (m, self.head_num),
                             dtype=torch.float32, device=self.device,
                         )
-                        for _ in range(self.layer_num)
+                        for i in range(self.layer_num)
                     ]
+
+                # Full-precision storage for skipped layers
+                for i in sorted(self._skip_layers_local):
+                    self._k_full_buffer[i] = torch.zeros(
+                        (m, self.head_num, self.head_dim),
+                        dtype=self.dtype, device=self.device,
+                    )
+                    self._v_full_buffer[i] = torch.zeros(
+                        (m, self.head_num, self.v_head_dim),
+                        dtype=self.dtype, device=self.device,
+                    )
 
                 # Shared workspace: pool-sized, NOT per-layer.  Only the
                 # active positions are filled on each _get call.  FlashInfer
@@ -269,25 +330,47 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         del self.k_buffer, self.v_buffer
         del self.k_norms_buffer, self.v_norms_buffer
         del self._k_ws, self._v_ws
+        if hasattr(self, "_k_full_buffer"):
+            del self._k_full_buffer, self._v_full_buffer
         if self.mode == "prod":
             del self.k_qjl_buffer, self.v_qjl_buffer
             del self.k_residual_norms_buffer, self.v_residual_norms_buffer
 
     def get_kv_size_bytes(self):
-        k_size = sum(get_tensor_size_bytes(b) for b in self.k_buffer)
-        k_size += sum(get_tensor_size_bytes(b) for b in self.k_norms_buffer)
+        # Iterate only over real (non-None) compressed entries
+        k_size = sum(
+            get_tensor_size_bytes(b) for b in self.k_buffer if b is not None
+        )
+        k_size += sum(
+            get_tensor_size_bytes(b) for b in self.k_norms_buffer if b is not None
+        )
         k_size += get_tensor_size_bytes(self._k_ws)
-        v_size = sum(get_tensor_size_bytes(b) for b in self.v_buffer)
-        v_size += sum(get_tensor_size_bytes(b) for b in self.v_norms_buffer)
+        v_size = sum(
+            get_tensor_size_bytes(b) for b in self.v_buffer if b is not None
+        )
+        v_size += sum(
+            get_tensor_size_bytes(b) for b in self.v_norms_buffer if b is not None
+        )
         v_size += get_tensor_size_bytes(self._v_ws)
+        # Full-precision storage for skipped layers
+        for b in self._k_full_buffer.values():
+            k_size += get_tensor_size_bytes(b)
+        for b in self._v_full_buffer.values():
+            v_size += get_tensor_size_bytes(b)
         if self.mode == "prod":
-            k_size += sum(get_tensor_size_bytes(b) for b in self.k_qjl_buffer)
             k_size += sum(
-                get_tensor_size_bytes(b) for b in self.k_residual_norms_buffer
+                get_tensor_size_bytes(b) for b in self.k_qjl_buffer if b is not None
             )
-            v_size += sum(get_tensor_size_bytes(b) for b in self.v_qjl_buffer)
+            k_size += sum(
+                get_tensor_size_bytes(b)
+                for b in self.k_residual_norms_buffer if b is not None
+            )
             v_size += sum(
-                get_tensor_size_bytes(b) for b in self.v_residual_norms_buffer
+                get_tensor_size_bytes(b) for b in self.v_qjl_buffer if b is not None
+            )
+            v_size += sum(
+                get_tensor_size_bytes(b)
+                for b in self.v_residual_norms_buffer if b is not None
             )
         return k_size, v_size
 
@@ -348,6 +431,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                     indices, self.k_hadamard, self._k_scaled_centroids,
                     self._k_ws, self.head_dim, self.padded_head_dim,
                     skip_hadamard=True,
+                    bits=int(self.bits),
                 )
             else:
                 turboquant_dequant_fused(
@@ -355,6 +439,7 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                     indices, self.v_hadamard, self._v_scaled_centroids,
                     self._v_ws, self.v_head_dim, self.v_padded_head_dim,
                     skip_hadamard=True,
+                    bits=int(self.bits),
                 )
             return
 
@@ -384,12 +469,14 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
                     self.k_buffer[idx], self.k_norms_buffer[idx],
                     indices, self.k_hadamard, self._k_scaled_centroids,
                     self._k_ws, self.head_dim, self.padded_head_dim,
+                    bits=int(self.bits),
                 )
             else:
                 turboquant_dequant_fused(
                     self.v_buffer[idx], self.v_norms_buffer[idx],
                     indices, self.v_hadamard, self._v_scaled_centroids,
                     self._v_ws, self.v_head_dim, self.v_padded_head_dim,
+                    bits=int(self.bits),
                 )
             return
 
@@ -451,13 +538,27 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         ws[indices] = recon
 
     def _get_key_buffer(self, layer_id: int):
-        """Dequant active positions into shared workspace and return it."""
+        """Dequant active positions into shared workspace and return it.
+
+        For layers in skip_layers, return the full-precision buffer directly
+        (no dequantization needed).
+        """
+        idx = layer_id - self.start_layer
+        if self._is_skipped(idx):
+            return self._k_full_buffer[idx]
         if self._active_indices is not None and self._active_indices.numel() > 0:
             self._dequant_positions(layer_id, "k")
         return self._k_ws
 
     def _get_value_buffer(self, layer_id: int):
-        """Dequant active positions into shared workspace and return it."""
+        """Dequant active positions into shared workspace and return it.
+
+        For layers in skip_layers, return the full-precision buffer directly
+        (no dequantization needed).
+        """
+        idx = layer_id - self.start_layer
+        if self._is_skipped(idx):
+            return self._v_full_buffer[idx]
         if self._active_indices is not None and self._active_indices.numel() > 0:
             self._dequant_positions(layer_id, "v")
         return self._v_ws
@@ -474,10 +575,22 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        """Quantize and store compressed KV entries."""
+        """Quantize and store compressed KV entries.
+
+        Skipped layers bypass quantization and write directly to the
+        full-precision per-layer buffer in the model's working dtype.
+        """
         layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
         idx = layer_id - self.start_layer
         num_tokens = cache_k.shape[0]
+
+        # Skip-layer fast path: store at full precision, no quantization.
+        if self._is_skipped(idx):
+            k_view = cache_k.reshape(num_tokens, self.head_num, self.head_dim)
+            v_view = cache_v.reshape(num_tokens, self.head_num, self.v_head_dim)
+            self._k_full_buffer[idx][loc] = k_view.to(self.dtype)
+            self._v_full_buffer[idx][loc] = v_view.to(self.dtype)
+            return
 
         k_flat = cache_k.reshape(-1, self.head_dim)
         v_flat = cache_v.reshape(-1, self.v_head_dim)
@@ -524,6 +637,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         if tgt_loc.numel() == 0:
             return
         for i in range(self.layer_num):
+            # Skipped layers: move full-precision buffers
+            if self._is_skipped(i):
+                self._k_full_buffer[i][tgt_loc] = self._k_full_buffer[i][src_loc]
+                self._v_full_buffer[i][tgt_loc] = self._v_full_buffer[i][src_loc]
+                continue
             self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
             self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
             self.k_norms_buffer[i][tgt_loc] = self.k_norms_buffer[i][src_loc]

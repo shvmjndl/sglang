@@ -329,6 +329,10 @@ class ServerArgs:
     kv_cache_dtype: str = "auto"
     turboquant_bits: float = 4.0
     turboquant_mode: str = "mse"
+    # Layer indices (0-based, global) that should NOT be quantized by TurboQuant.
+    # For example, [0, 1] keeps the first two layers in full precision while
+    # all other layers are TurboQuant-compressed.
+    turboquant_skip_layers: Optional[List[int]] = None
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -3793,6 +3797,19 @@ class ServerArgs:
             default=ServerArgs.turboquant_mode,
             choices=["mse", "prod"],
             help='TurboQuant mode: "mse" for MSE-optimal, "prod" for QJL inner-product. Default "mse".',
+        )
+        parser.add_argument(
+            "--turboquant-skip-layers",
+            type=int,
+            nargs="+",
+            default=ServerArgs.turboquant_skip_layers,
+            help=(
+                "Global layer indices (0-based) that should NOT be quantized "
+                "by TurboQuant. These layers keep their KV cache in the "
+                "model's working dtype (e.g., bf16). Example: "
+                "`--turboquant-skip-layers 0 1` keeps the first two layers in "
+                "full precision while all other layers are TurboQuant-compressed."
+            ),
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

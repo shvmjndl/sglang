@@ -1855,6 +1855,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._turboquant_enabled = True
             self._turboquant_bits = self.server_args.turboquant_bits
             self._turboquant_mode = self.server_args.turboquant_mode
+            # Layers (global indices) to keep in full precision.
+            self._turboquant_skip_layers = (
+                list(self.server_args.turboquant_skip_layers)
+                if self.server_args.turboquant_skip_layers
+                else []
+            )
             # Regular CUDA graph captures decode at fixed batch sizes — the
             # dequant shapes change per batch, so disable it.  Piecewise CUDA
             # graph captures prefill at fixed token counts and works fine.
@@ -1871,6 +1877,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"TurboQuant KV cache compression enabled "
                 f"({self._turboquant_bits}-bit, mode={self._turboquant_mode}, ICLR 2026)",
             )
+            if self._turboquant_skip_layers:
+                log_info_on_rank0(
+                    logger,
+                    f"TurboQuant skipping layers (kept in full precision): "
+                    f"{self._turboquant_skip_layers}",
+                )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
