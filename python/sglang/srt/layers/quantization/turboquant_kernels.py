@@ -171,21 +171,6 @@ class HadamardTransform:
         self.signs = _generate_random_signs(self.padded_dim, seed, device)
         self.scale = 1.0 / math.sqrt(self.padded_dim)
         self.device = device
-        self.q_matrix=self.random_orthogonal_torch(self.padded_dim,self.device)
-
-    def random_orthogonal_torch(
-        self,
-        d:int,
-        device=None,
-        dtype=torch.float32,
-    )->torch.Tensor:
-        G = torch.randn((d, d), device=device, dtype=dtype)
-        Q, R = torch.linalg.qr(G, mode="reduced")
-
-        signs = torch.sign(torch.diagonal(R))
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        Q = Q * signs.unsqueeze(0)
-        return Q
 
     def _apply_hadamard(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the unscaled Hadamard transform H*x using the fastest available backend."""
@@ -203,8 +188,19 @@ class HadamardTransform:
         Returns:
             (..., padded_dim) tensor of rotated coordinates
         """
+        d = x.shape[-1]
 
-        return x@self.q_matrix
+        # Pad to power-of-2 if needed
+        if d < self.padded_dim:
+            x = torch.nn.functional.pad(x, (0, self.padded_dim - d))
+
+        # Apply random signs
+        x = x * self.signs
+
+        # Fast Walsh-Hadamard Transform
+        x = self._apply_hadamard(x)
+
+        return x * self.scale
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse randomized Hadamard: x = diag(signs) * H * scale * y.
@@ -213,7 +209,9 @@ class HadamardTransform:
         So full inverse = diag(signs) * (1/d) * H * (y / scale)
         But scale = 1/sqrt(d), so (1/d) * (1/scale) = 1/sqrt(d) = scale.
         """
-        return y @(self.q_matrix.transpose(-2,-1))
+        x = self._apply_hadamard(y) * self.scale
+        x = x * self.signs
+        return x[..., : self.dim]
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +560,7 @@ def turboquant_dequant_fused(
     head_dim: int,
     padded_dim: int,
     skip_hadamard: bool = False,
+    bits: int = 4,
 ):
     """Fused dequant: 3 kernels (full) or 2 kernels (rotated-domain).
 
@@ -574,6 +573,13 @@ def turboquant_dequant_fused(
       1. Triton: gather + unpack + centroid + norm → flat
       2. Triton: truncate + cast + scatter → workspace
       Skips Hadamard/signs — the attention backend rotates Q/output instead.
+
+    The `bits` argument selects the unpack kernel: 4 → 4-bit kernel,
+    3 → 3-bit kernel, 2 / 1 → PyTorch fallback. (Without this dispatch
+    the 4-bit kernel would be invoked for every bit-width and Triton
+    would crash at compile time on `tl.arange(0, PACKED_DIM)` when
+    PACKED_DIM is not a power of 2 — true for 3-bit packing where
+    e.g. padded=128 → packed=48.)
     """
     n_active = indices.shape[0]
     num_heads = packed.shape[1]
@@ -583,14 +589,38 @@ def turboquant_dequant_fused(
     flat = torch.empty(n_active * num_heads, padded_dim,
                        dtype=torch.float32, device=packed.device)
 
-    _fused_gather_unpack_norm_4bit_kernel[(n_active, num_heads)](
-        packed, norms, indices, scaled_centroids, flat,
-        packed.stride(0), packed.stride(1),
-        norms.stride(0),
-        NUM_HEADS=num_heads,
-        PADDED_DIM=padded_dim,
-        PACKED_DIM=packed_dim,
-    )
+    if bits == 4:
+        _fused_gather_unpack_norm_4bit_kernel[(n_active, num_heads)](
+            packed, norms, indices, scaled_centroids, flat,
+            packed.stride(0), packed.stride(1),
+            norms.stride(0),
+            NUM_HEADS=num_heads,
+            PADDED_DIM=padded_dim,
+            PACKED_DIM=packed_dim,
+        )
+    elif bits == 3:
+        # 3-bit packs 8 indices into 3 bytes; PACKED_DIM = padded * 3 // 8
+        # is generally not a power of 2 (e.g. 48 for padded=128), so the
+        # dedicated 3-bit kernel uses NUM_GROUPS-based static unrolling
+        # instead of tl.arange(0, PACKED_DIM).
+        num_groups = padded_dim // 8
+        _fused_gather_unpack_norm_3bit_kernel[(n_active, num_heads)](
+            packed, norms, indices, scaled_centroids, flat,
+            packed.stride(0), packed.stride(1),
+            norms.stride(0),
+            NUM_HEADS=num_heads,
+            PADDED_DIM=padded_dim,
+            PACKED_DIM=packed_dim,
+            NUM_GROUPS=num_groups,
+        )
+    else:
+        # 2-bit / 1-bit: no fused Triton kernel yet, fall back to PyTorch
+        # gather + unpack (rare path; the hot paths are bits=4 / bits=3).
+        sel = packed[indices]                              # (n, heads, packed_dim)
+        flat_packed = sel.reshape(-1, packed_dim)          # (n*heads, packed_dim)
+        unpacked = unpack_indices(flat_packed, bits, padded_dim)  # (n*heads, padded_dim)
+        sel_norms = norms[indices].reshape(-1, 1)          # (n*heads, 1)
+        flat = scaled_centroids[unpacked.long()] * sel_norms
 
     if skip_hadamard:
         # Rotated domain: just truncate + cast + scatter. No signs, no scale.
@@ -988,7 +1018,9 @@ def turboquant_dequantize(
         qjl_scale = math.sqrt(math.pi / 2 / padded_dim) 
         qjl_signs=hadamard.inverse(qjl_signs)
         dequant += qjl_scale * residual_norms.unsqueeze(-1) * qjl_signs
-
+    else:
+        dequant = hadamard.inverse(dequant)  
+        
     # Rescale by original norm
     dequant = dequant * norms.unsqueeze(-1)
 
